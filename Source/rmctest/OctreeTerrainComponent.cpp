@@ -108,6 +108,8 @@ public:
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, DrawArgs)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, AllocState)
 		SHADER_PARAMETER(uint32, IdentityCount)
+		SHADER_PARAMETER(uint32, InitStride)
+		SHADER_PARAMETER(uint32, ClearControl)
 		SHADER_PARAMETER(uint32, MaxChunks)
 	END_SHADER_PARAMETER_STRUCT()
 };
@@ -441,7 +443,7 @@ public:
 				BatchElement.IndirectArgsOffset = ActiveSlots[i] * 8 * sizeof(uint32);
 				BatchElement.FirstIndex = 0;
 				BatchElement.NumPrimitives = 0;   // must be 0 when using IndirectArgsBuffer
-				BatchElement.BaseVertexIndex = 0; // args carry the real BaseVertexLocation
+				BatchElement.BaseVertexIndex = 0; // args carry StartIndexLocation; identity IB maps index -> global vertex id
 				BatchElement.MinVertexIndex = 0;
 				BatchElement.MaxVertexIndex = Capacity > 0 ? Capacity - 1 : 0;
 			}
@@ -558,10 +560,12 @@ void UOctreeTerrainComponent::EnsureNoiseDefaults()
 			Layer.Frequency = Frequency;
 			Layer.Amplitude = Amplitude;
 		};
-		AddLayer(0.00002f, 30000.0f);
-		AddLayer(0.0001f, 8000.0f);
-		AddLayer(0.0008f, 1500.0f);
-		AddLayer(0.005f, 250.0f);
+		// Keep frequency x amplitude (= slope) moderate: steeper than ~1 turns
+		// into cliff/needle fields that only the finest LOD can sample.
+		AddLayer(0.00002f, 25000.0f);
+		AddLayer(0.0001f, 6000.0f);
+		AddLayer(0.0008f, 600.0f);
+		AddLayer(0.005f, 60.0f);
 	}
 	while (NoiseLayers.Num() > 8)
 	{
@@ -1180,16 +1184,25 @@ void UOctreeTerrainComponent::BuildAndEnqueueUpdate(const FVector& PlayerPos)
 				FRDGBufferDesc StateDesc = FRDGBufferDesc::CreateBufferDesc(4, 8);
 				StateDesc.Usage |= BUF_SourceCopy;
 				StateBuf = GraphBuilder.CreateBuffer(StateDesc, TEXT("OctreeAllocState"));
-
-				FRDGBufferDesc IdentDesc = FRDGBufferDesc::CreateBufferDesc(4, B.MaxVertsPerChunkClamp);
-				IdentDesc.Usage |= BUF_IndexBuffer | BUF_UnorderedAccess | BUF_ShaderResource;
-				IdentBuf = GraphBuilder.CreateBuffer(IdentDesc, TEXT("OctreeIdentityIB"));
 			}
 			else
 			{
 				ArgsBuf = GraphBuilder.RegisterExternalBuffer(PoolArgs);
 				AllocBuf = GraphBuilder.RegisterExternalBuffer(PoolAlloc);
 				StateBuf = GraphBuilder.RegisterExternalBuffer(PoolState);
+			}
+
+			// The identity index buffer spans the whole vertex pool (the index
+			// value IS the global vertex id), so it is rebuilt at pool size
+			// whenever the pool itself is (re)created.
+			if (bSwapPools)
+			{
+				FRDGBufferDesc IdentDesc = FRDGBufferDesc::CreateBufferDesc(4, B.Capacity);
+				IdentDesc.Usage |= BUF_IndexBuffer | BUF_UnorderedAccess | BUF_ShaderResource;
+				IdentBuf = GraphBuilder.CreateBuffer(IdentDesc, TEXT("OctreeIdentityIB"));
+			}
+			else
+			{
 				IdentBuf = GraphBuilder.RegisterExternalBuffer(PoolIdentity);
 			}
 
@@ -1261,8 +1274,8 @@ void UOctreeTerrainComponent::BuildAndEnqueueUpdate(const FVector& PlayerPos)
 
 			const auto ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
 
-			// --- PASS: one-time init ------------------------------------------
-			if (B.bInit)
+			// --- PASS: pool init (identity IB fill; allocator reset on first init)
+			if (bSwapPools)
 			{
 				TShaderMapRef<FOctreeInitPoolCS> CS(ShaderMap);
 				auto* P = GraphBuilder.AllocParameters<FOctreeInitPoolCS::FParameters>();
@@ -1270,11 +1283,14 @@ void UOctreeTerrainComponent::BuildAndEnqueueUpdate(const FVector& PlayerPos)
 				P->ChunkAlloc = GraphBuilder.CreateUAV(AllocBuf, PF_R32G32B32A32_UINT);
 				P->DrawArgs = GraphBuilder.CreateUAV(ArgsBuf, PF_R32_UINT);
 				P->AllocState = GraphBuilder.CreateUAV(StateBuf, PF_R32_UINT);
-				P->IdentityCount = B.MaxVertsPerChunkClamp;
+				P->IdentityCount = B.Capacity;
+				P->ClearControl = B.bInit ? 1 : 0;
 				P->MaxChunks = B.MaxChunks;
-				const uint32 MaxItems = FMath::Max(B.MaxVertsPerChunkClamp, B.MaxChunks);
+				const uint32 MaxItems = FMath::Max(B.Capacity, B.MaxChunks);
+				const uint32 NumGroups = FMath::Min(FMath::DivideAndRoundUp(MaxItems, 64u), 16384u);
+				P->InitStride = NumGroups * 64u;
 				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("OctreeInitPool"), CS, P,
-					FIntVector(FMath::DivideAndRoundUp(MaxItems, 64u), 1, 1));
+					FIntVector(int32(NumGroups), 1, 1));
 			}
 
 			// --- PASS: count --------------------------------------------------
@@ -1422,13 +1438,13 @@ void UOctreeTerrainComponent::BuildAndEnqueueUpdate(const FVector& PlayerPos)
 				GraphBuilder.QueueBufferExtraction(TanBuf, &PoolTan, ERHIAccess::UAVCompute);
 				GraphBuilder.QueueBufferExtraction(UVBuf, &PoolUV, ERHIAccess::UAVCompute);
 				GraphBuilder.QueueBufferExtraction(ColBuf, &PoolColor, ERHIAccess::UAVCompute);
+				GraphBuilder.QueueBufferExtraction(IdentBuf, &PoolIdentity, ERHIAccess::UAVCompute);
 			}
 			if (B.bInit)
 			{
 				GraphBuilder.QueueBufferExtraction(ArgsBuf, &PoolArgs, ERHIAccess::UAVCompute);
 				GraphBuilder.QueueBufferExtraction(AllocBuf, &PoolAlloc, ERHIAccess::UAVCompute);
 				GraphBuilder.QueueBufferExtraction(StateBuf, &PoolState, ERHIAccess::UAVCompute);
-				GraphBuilder.QueueBufferExtraction(IdentBuf, &PoolIdentity, ERHIAccess::UAVCompute);
 			}
 
 			GraphBuilder.Execute();
@@ -1545,14 +1561,17 @@ void UOctreeTerrainComponent::PollReadbacks()
 					return;
 				}
 
+				// The GPU soup's emit order faces into the solid in UE's
+				// left-handed world; Chaos trimesh queries are one-sided, so
+				// flip the winding to face outward.
 				TArray<FTriIndices> NewTris;
 				NewTris.Reserve(NewVerts.Num() / 3);
 				for (int32 i = 0; i + 2 < NewVerts.Num(); i += 3)
 				{
 					FTriIndices T;
 					T.v0 = i;
-					T.v1 = i + 1;
-					T.v2 = i + 2;
+					T.v1 = i + 2;
+					T.v2 = i + 1;
 					NewTris.Add(T);
 				}
 

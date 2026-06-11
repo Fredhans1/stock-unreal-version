@@ -152,7 +152,7 @@ private:
 	int32  CellsN = 32;                 // sanitized GridResolution
 	int32  ChunksPerLOD = 0;            // ChunksPerSide^2 * ChunksVertical
 	int32  MaxChunks = 0;               // ChunksPerLOD * NumLODLevels
-	uint32 MaxVertsPerChunkClamp = 0;   // identity index buffer size
+	uint32 MaxVertsPerChunkClamp = 0;   // per-chunk vertex count safety cap
 	uint32 CurrentCapacity = 0;         // live vertex-pool capacity
 	double ZBandMin = 0.0;              // conservative surface height bounds
 	double ZBandMax = 0.0;
