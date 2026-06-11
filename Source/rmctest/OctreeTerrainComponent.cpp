@@ -89,6 +89,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FOctreeChunkParams, )
 	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, DirtyInfoA)
 	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint4>, DirtyInfoB)
 	SHADER_PARAMETER(uint32, DirtyCount)
+	SHADER_PARAMETER(uint32, DirtyBase)
 	SHADER_PARAMETER(uint32, CellsPerAxis)
 	SHADER_PARAMETER(uint32, GroupsPerAxis)
 	SHADER_PARAMETER_ARRAY(FVector4f, FinerVolMin, [10])
@@ -1238,11 +1239,12 @@ void UOctreeTerrainComponent::BuildAndEnqueueUpdate(const FVector& PlayerPos)
 				S.EditIndexList = GraphBuilder.CreateSRV(EditIdxBuf, PF_R32_UINT);
 			};
 
-			auto FillChunk = [&](FOctreeChunkParams& C)
+			auto FillChunk = [&](FOctreeChunkParams& C, uint32 DirtyBase)
 			{
 				C.DirtyInfoA = GraphBuilder.CreateSRV(DirtyABuf, PF_A32B32G32R32F);
 				C.DirtyInfoB = GraphBuilder.CreateSRV(DirtyBBuf, PF_R32G32B32A32_UINT);
 				C.DirtyCount = DirtyCount;
+				C.DirtyBase = DirtyBase;
 				C.CellsPerAxis = B.CellsPerAxis;
 				C.GroupsPerAxis = B.GroupsPerAxis;
 				for (int32 i = 0; i < 10; i++)
@@ -1251,6 +1253,11 @@ void UOctreeTerrainComponent::BuildAndEnqueueUpdate(const FVector& PlayerPos)
 					C.FinerVolMax[i] = (i < B.FinerMax.Num()) ? B.FinerMax[i] : FVector4f(-1e30f, -1e30f, -1e30f, 0);
 				}
 			};
+
+			// D3D caps dispatches at 65535 groups per dimension; a force-all
+			// rebuild can exceed that on the Z axis, so the per-chunk cell
+			// passes split the dirty list into batches.
+			const uint32 MaxChunksPerDispatch = FMath::Max(1u, 65535u / FMath::Max(B.GroupsPerAxis, 1u));
 
 			const auto ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
 
@@ -1277,12 +1284,16 @@ void UOctreeTerrainComponent::BuildAndEnqueueUpdate(const FVector& PlayerPos)
 				AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(CursorsBuf, PF_R32_UINT), 0u);
 
 				TShaderMapRef<FOctreeCountCS> CS(ShaderMap);
-				auto* P = GraphBuilder.AllocParameters<FOctreeCountCS::FParameters>();
-				FillSDF(P->SDF);
-				FillChunk(P->Chunk);
-				P->Counts = GraphBuilder.CreateUAV(CountsBuf, PF_R32_UINT);
-				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("OctreeCount"), CS, P,
-					FIntVector(B.GroupsPerAxis, B.GroupsPerAxis, B.GroupsPerAxis * DirtyCount));
+				for (uint32 Base = 0; Base < DirtyCount; Base += MaxChunksPerDispatch)
+				{
+					const uint32 Num = FMath::Min(MaxChunksPerDispatch, DirtyCount - Base);
+					auto* P = GraphBuilder.AllocParameters<FOctreeCountCS::FParameters>();
+					FillSDF(P->SDF);
+					FillChunk(P->Chunk, Base);
+					P->Counts = GraphBuilder.CreateUAV(CountsBuf, PF_R32_UINT);
+					FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("OctreeCount"), CS, P,
+						FIntVector(B.GroupsPerAxis, B.GroupsPerAxis, B.GroupsPerAxis * Num));
+				}
 			}
 
 			// --- PASS: allocation ---------------------------------------------
@@ -1341,21 +1352,25 @@ void UOctreeTerrainComponent::BuildAndEnqueueUpdate(const FVector& PlayerPos)
 			if (DirtyCount > 0)
 			{
 				TShaderMapRef<FOctreeMeshCS> CS(ShaderMap);
-				auto* P = GraphBuilder.AllocParameters<FOctreeMeshCS::FParameters>();
-				FillSDF(P->SDF);
-				FillChunk(P->Chunk);
-				P->ChunkAllocRO = GraphBuilder.CreateSRV(AllocBuf, PF_R32G32B32A32_UINT);
-				P->MeshSkipRO = GraphBuilder.CreateSRV(MeshSkipBuf, PF_R32_UINT);
-				P->Cursors = GraphBuilder.CreateUAV(CursorsBuf, PF_R32_UINT);
-				P->OutPositions = GraphBuilder.CreateUAV(PosBuf, PF_A32B32G32R32F);
-				P->OutTangents = GraphBuilder.CreateUAV(TanBuf, PF_A32B32G32R32F);
-				P->OutUVs = GraphBuilder.CreateUAV(UVBuf, PF_G32R32F);
-				P->OutColors = GraphBuilder.CreateUAV(ColBuf, PF_R32_UINT);
-				P->WorldUVScale = B.WorldUVScale;
-				P->ZBandMin = B.ZBandMin;
-				P->ZBandMax = B.ZBandMax;
-				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("OctreeMesh"), CS, P,
-					FIntVector(B.GroupsPerAxis, B.GroupsPerAxis, B.GroupsPerAxis * DirtyCount));
+				for (uint32 Base = 0; Base < DirtyCount; Base += MaxChunksPerDispatch)
+				{
+					const uint32 Num = FMath::Min(MaxChunksPerDispatch, DirtyCount - Base);
+					auto* P = GraphBuilder.AllocParameters<FOctreeMeshCS::FParameters>();
+					FillSDF(P->SDF);
+					FillChunk(P->Chunk, Base);
+					P->ChunkAllocRO = GraphBuilder.CreateSRV(AllocBuf, PF_R32G32B32A32_UINT);
+					P->MeshSkipRO = GraphBuilder.CreateSRV(MeshSkipBuf, PF_R32_UINT);
+					P->Cursors = GraphBuilder.CreateUAV(CursorsBuf, PF_R32_UINT);
+					P->OutPositions = GraphBuilder.CreateUAV(PosBuf, PF_A32B32G32R32F);
+					P->OutTangents = GraphBuilder.CreateUAV(TanBuf, PF_A32B32G32R32F);
+					P->OutUVs = GraphBuilder.CreateUAV(UVBuf, PF_G32R32F);
+					P->OutColors = GraphBuilder.CreateUAV(ColBuf, PF_R32_UINT);
+					P->WorldUVScale = B.WorldUVScale;
+					P->ZBandMin = B.ZBandMin;
+					P->ZBandMax = B.ZBandMax;
+					FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("OctreeMesh"), CS, P,
+						FIntVector(B.GroupsPerAxis, B.GroupsPerAxis, B.GroupsPerAxis * Num));
+				}
 			}
 
 			// --- PASS: collision gather ----------------------------------------
