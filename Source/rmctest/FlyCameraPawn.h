@@ -1,5 +1,3 @@
-﻿// Fill out your copyright notice in the Description page of Project Settings.
-
 #pragma once
 
 #include "CoreMinimal.h"
@@ -19,56 +17,45 @@ class RMCTEST_API AFlyCameraPawn : public APawn
 public:
 	AFlyCameraPawn();
 
-protected:
-	virtual void BeginPlay() override;
-
-public:	
-	virtual void Tick(float DeltaTime) override;
-
-	virtual void SetupPlayerInputComponent(class UInputComponent* PlayerInputComponent) override;
+	virtual void SetupPlayerInputComponent(UInputComponent* PlayerInputComponent) override;
 
 protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Camera")
-	UCameraComponent* CameraComponent;
+	TObjectPtr<UCameraComponent> CameraComponent;
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Movement")
-	UFloatingPawnMovement* MovementComponent;
+	TObjectPtr<UFloatingPawnMovement> MovementComponent;
 
-	/** Move Input Action */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
-	UInputAction* MoveAction;
+	TObjectPtr<UInputAction> MoveAction;
 
-	/** Look Input Action */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
-	UInputAction* LookAction;
+	TObjectPtr<UInputAction> LookAction;
 
-    /** Up/Down Move Input Action */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
-	UInputAction* MoveUpAction;
+	TObjectPtr<UInputAction> MoveUpAction;
 
-	/** Current sphere-edit radius (diameter/2). */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Terrain Edit")
-	float EditRadius;
+	float EditRadius = 250.0f;
 
-	/** If true, LMB subtracts (digs); otherwise adds (fills). Toggled by Q. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Terrain Edit")
-	bool bSubtractMode;
+	bool bSubtractMode = false;
 
-protected:
+private:
 	void Move(const FInputActionValue& Value);
 	void Look(const FInputActionValue& Value);
-    void MoveUp(const FInputActionValue& Value);
+	void MoveUp(const FInputActionValue& Value);
 
-    // Legacy Input Handlers for hardcoded keys
-    void MoveForward(float Value);
-    void MoveRight(float Value);
-    void MoveUpLegacy(float Value);
-    void LookYaw(float Value);
-    void LookPitch(float Value);
+	void MoveForward(float Value);
+	void MoveBackward(float Value);
+	void MoveRight(float Value);
+	void MoveLeft(float Value);
+	void MoveUpDirect(float Value);
+	void MoveDown(float Value);
+	void LookYaw(float Value);
+	void LookPitch(float Value);
 
-    // Terrain edit inputs
-    void ToggleEditMode();
-    void GrowEditRadius();
-    void PerformTerrainEdit();
-
+	void ToggleEditMode();
+	void GrowEditRadius();
+	void PerformTerrainEdit();
 };

@@ -1,14 +1,52 @@
 #pragma once
 
+#include <atomic>
+
 #include "CoreMinimal.h"
 #include "Components/PrimitiveComponent.h"
 #include "Interfaces/Interface_CollisionDataProvider.h"
 #include "PhysicsEngine/BodySetup.h"
+#include "RHIGPUReadback.h"
+#include "RenderGraphUtils.h"
 
 #include "OctreeTerrainComponent.generated.h"
 
 class FOctreeTerrainSceneProxy;
 
+USTRUCT(BlueprintType)
+struct FOctreeNoiseLayer
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Noise")
+	float Frequency = 0.0001f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Noise")
+	float Amplitude = 8000.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Noise")
+	float OffsetX = 0.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Noise")
+	float OffsetY = 0.0f;
+};
+
+// GPU-resident voxel terrain.
+//
+// A 3D clipmap of marching-cubes chunks is generated and kept entirely on the
+// GPU: the CPU only decides which chunks are dirty (ring shifts, sphere edits,
+// LOD carve-boundary changes) and dispatches compute. Every chunk allocates an
+// exact-size range in one shared vertex pool (count pass -> bump allocator ->
+// mesh pass), so chunk vertex counts vary freely with the landscape and no VRAM
+// is spent on padding or empty chunks. Draws are per-chunk DrawIndexedIndirect
+// with a GPU-written BaseVertexLocation and a shared identity index buffer.
+//
+// Sphere edits (add/subtract) re-mesh only the chunks they touch, so they run
+// comfortably at per-frame rates. Collision for line traces / physics is a
+// GPU-gathered readback of the LOD 0 chunks around the player, cooked async.
+//
+// The component expects to sit at the world origin (vertices are generated in
+// world space, like VoxelMeshComponent).
 UCLASS(ClassGroup = Rendering, meta = (BlueprintSpawnableComponent))
 class RMCTEST_API UOctreeTerrainComponent final
 	: public UPrimitiveComponent
@@ -19,57 +57,66 @@ class RMCTEST_API UOctreeTerrainComponent final
 public:
 	UOctreeTerrainComponent();
 
+	// ── Grid configuration ─────────────────────────────────────────────────
+
+	// World size of a LOD 0 chunk (cm). Cell size at LOD 0 = BaseChunkSize / GridResolution.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OctreeTerrain|Grid", meta = (ClampMin = "100.0"))
 	float BaseChunkSize = 1000.0f;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OctreeTerrain|Grid", meta = (ClampMin = "4", ClampMax = "64"))
-	int32 GridResolution = 16;
+	// Marching-cubes cells per chunk axis. Rounded to a multiple of 8.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OctreeTerrain|Grid", meta = (ClampMin = "8", ClampMax = "64"))
+	int32 GridResolution = 32;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OctreeTerrain|Grid", meta = (ClampMin = "1", ClampMax = "8"))
-	int32 NumLODLevels = 4;
+	// Each LOD doubles the chunk size. The finer LOD's ring volume is carved
+	// out of the coarser LOD, clipmap style.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OctreeTerrain|Grid", meta = (ClampMin = "1", ClampMax = "10"))
+	int32 NumLODLevels = 7;
 
+	// Horizontal chunks per ring side (per LOD).
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OctreeTerrain|Grid", meta = (ClampMin = "3", ClampMax = "21"))
-	int32 ChunksPerSide = 11;
+	int32 ChunksPerSide = 9;
 
-	// Retained for compatibility with existing assets. The stock implementation
-	// renders a heightfield and therefore does not allocate vertical chunk layers.
+	// Vertical chunk layers per LOD, centered on the player.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OctreeTerrain|Grid", meta = (ClampMin = "1", ClampMax = "13"))
-	int32 ChunksVertical = 1;
+	int32 ChunksVertical = 4;
 
+	// Player movement (cm) before the clipmap re-centers.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OctreeTerrain|Grid", meta = (ClampMin = "0.0"))
-	float UpdateThreshold = 100.0f;
+	float UpdateThreshold = 500.0f;
 
-	// Retained for compatibility with existing assets. CPU mesh sizing is
-	// derived from GridResolution.
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OctreeTerrain|Grid", meta = (ClampMin = "1024"))
-	int32 MaxVertsPerChunk = 2048;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OctreeTerrain|Grid", meta = (ClampMin = "6144"))
-	int32 MaxIndicesPerChunk = 12288;
+	// Initial shared vertex-pool capacity. The pool compacts and grows
+	// automatically when the landscape needs more, so this is just a hint.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OctreeTerrain|Grid", meta = (ClampMin = "65536"))
+	int32 InitialPoolVertexCapacity = 4000000;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OctreeTerrain")
 	TObjectPtr<UMaterialInterface> TerrainMaterial;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OctreeTerrain|Noise", meta = (ClampMin = "0.0"))
-	float HeightScale = 8000.0f;
+	// ── Landscape definition ────────────────────────────────────────────────
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OctreeTerrain|Noise", meta = (ClampMin = "0.000001"))
-	float NoiseFrequency = 0.0001f;
+	// 2D perlin height layers (filled with defaults at BeginPlay when empty).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OctreeTerrain|Noise")
+	TArray<FOctreeNoiseLayer> NoiseLayers;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OctreeTerrain|Noise", meta = (ClampMin = "1", ClampMax = "8"))
-	int32 NoiseOctaves = 5;
-
+	// Optional 3D noise carved into the height field (caves / overhang detail).
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OctreeTerrain|Noise", meta = (ClampMin = "0.0"))
 	float CaveNoiseFrequency = 0.0f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OctreeTerrain|Noise", meta = (ClampMin = "0.0"))
 	float CaveNoiseAmplitude = 0.0f;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OctreeTerrain|Collision", meta = (ClampMin = "1", ClampMax = "32"))
-	int32 CollisionDownsampleFactor = 2;
+	// UV = world XY * this scale.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OctreeTerrain|Rendering", meta = (ClampMin = "0.000001"))
+	float WorldUVScale = 0.0005f;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OctreeTerrain|Rendering", meta = (ClampMin = "0.0"))
-	float SkirtDepth = 1000.0f;
+	// ── Collision ──────────────────────────────────────────────────────────
+
+	// LOD 0 chunk radius (chebyshev) around the player gathered into the
+	// physics tri-mesh.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OctreeTerrain|Collision", meta = (ClampMin = "1", ClampMax = "8"))
+	int32 CollisionRadiusChunks = 2;
+
+	// ── Edit API ───────────────────────────────────────────────────────────
 
 	UFUNCTION(BlueprintCallable, Category = "OctreeTerrain")
 	void ApplySphereEdit(FVector Center, float Radius, bool bSubtract);
@@ -80,69 +127,108 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "OctreeTerrain")
 	void RebuildTerrain();
 
+	// ── UPrimitiveComponent ────────────────────────────────────────────────
+
 	virtual void BeginPlay() override;
-	virtual void TickComponent(
-		float DeltaTime,
-		ELevelTick TickType,
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+	virtual void TickComponent(float DeltaTime, ELevelTick TickType,
 		FActorComponentTickFunction* ThisTickFunction) override;
 	virtual FPrimitiveSceneProxy* CreateSceneProxy() override;
 	virtual FBoxSphereBounds CalcBounds(const FTransform& LocalToWorld) const override;
-	virtual void GetUsedMaterials(
-		TArray<UMaterialInterface*>& OutMaterials,
+	virtual void GetUsedMaterials(TArray<UMaterialInterface*>& OutMaterials,
 		bool bGetDebugMaterials = false) const override;
 	virtual UBodySetup* GetBodySetup() override;
 
-	virtual bool GetPhysicsTriMeshData(
-		FTriMeshCollisionData* CollisionData,
-		bool InUseAllTriData) override;
+	// ── IInterface_CollisionDataProvider ───────────────────────────────────
+
+	virtual bool GetPhysicsTriMeshData(FTriMeshCollisionData* CollisionData, bool InUseAllTriData) override;
 	virtual bool ContainsPhysicsTriMeshData(bool InUseAllTriData) const override;
 	virtual bool WantsNegXTriMesh() override { return false; }
 
 private:
 	friend class FOctreeTerrainSceneProxy;
 
-	struct FSphereEdit
-	{
-		FVector Center = FVector::ZeroVector;
-		float Radius = 0.0f;
-		bool bSubtract = true;
-	};
+	// ── Derived configuration (computed at BeginPlay) ──────────────────────
+	int32  CellsN = 32;                 // sanitized GridResolution
+	int32  ChunksPerLOD = 0;            // ChunksPerSide^2 * ChunksVertical
+	int32  MaxChunks = 0;               // ChunksPerLOD * NumLODLevels
+	uint32 MaxVertsPerChunkClamp = 0;   // identity index buffer size
+	uint32 CurrentCapacity = 0;         // live vertex-pool capacity
+	double ZBandMin = 0.0;              // conservative surface height bounds
+	double ZBandMax = 0.0;
+	bool   bGPUInitialized = false;
 
+	double ChunkSizeForLOD(int32 LOD) const;
 	FVector GetPlayerPosition() const;
-	float SampleHeight(double WorldX, double WorldY) const;
-	FVector3f SampleNormal(double WorldX, double WorldY, double Step) const;
-	void BuildTerrainMesh(const FVector& PlayerPosition);
-	void AppendChunk(
-		int32 LOD,
-		int32 ChunkX,
-		int32 ChunkY,
-		const FVector2D& ChunkOrigin,
-		float ChunkSize,
-		int32 Resolution,
-		bool bBuildCollision);
-	void AppendSkirts(
-		int32 FirstVertex,
-		int32 Resolution,
-		float Depth);
-	void RebuildCollision();
 
-	TArray<FSphereEdit> SphereEdits;
+	void SanitizeConfig();
+	void EnsureNoiseDefaults();
 
-	TArray<FVector3f> MeshPositions;
-	TArray<FVector3f> MeshNormals;
-	TArray<FVector2f> MeshUVs;
-	TArray<FColor> MeshColors;
-	TArray<uint32> MeshIndices;
+	// ── CPU mirror of the GPU chunk grid ───────────────────────────────────
+	// Slot index = LOD * ChunksPerLOD + (sz * CPS + sy) * CPS + sx, with
+	// toroidal coord->slot mapping so chunks keep their slot while inside the
+	// ring (only chunks entering the ring get re-meshed on movement).
+	TArray<FIntVector> SlotCoord;
+	TArray<uint8>      SlotActive;
+	TArray<FIntVector> RingOrigin;      // per LOD, in that LOD's chunk units
+	bool               bForceAllDirty = true;
+	bool               bUpdateRequested = false;
 
-	TArray<FVector3f> CollisionVertices;
-	TArray<FTriIndices> CollisionTriangles;
+	bool ChunkMayHaveSurface(const FIntVector& Coord, int32 LOD) const;
+	FBox ChunkBox(const FIntVector& Coord, int32 LOD) const;
+	FBox FinerRingBox(const FIntVector& Origin, int32 FinerLOD) const;
+
+	// Builds the dirty set + upload payload and enqueues the GPU update graph.
+	void BuildAndEnqueueUpdate(const FVector& PlayerPos);
+
+	// ── Edits ──────────────────────────────────────────────────────────────
+	// xyz = center, w = +radius (add) / -radius (subtract); applied in order.
+	TArray<FVector4f> Edits;
+	int32             NumPendingEdits = 0;
+
+	// ── Pool management (driven by the AllocState readback) ───────────────
+	bool   bWantCompact = false;
+	uint32 PendingNewCapacity = 0;
+	void HandleAllocState(uint32 Head, uint32 Overflow, uint32 TotalLive);
+
+	// ── GPU-resident buffers (created on the render thread, refs cached here
+	//    so they survive scene-proxy recreation) ─────────────────────────────
+	TRefCountPtr<FRDGPooledBuffer> PoolPos;
+	TRefCountPtr<FRDGPooledBuffer> PoolTan;
+	TRefCountPtr<FRDGPooledBuffer> PoolUV;
+	TRefCountPtr<FRDGPooledBuffer> PoolColor;
+	TRefCountPtr<FRDGPooledBuffer> PoolIdentity;
+	TRefCountPtr<FRDGPooledBuffer> PoolArgs;
+	TRefCountPtr<FRDGPooledBuffer> PoolAlloc;
+	TRefCountPtr<FRDGPooledBuffer> PoolState;
+
+	// Active slots from the latest update; the proxy only emits draw calls for
+	// these (inactive slots cannot contain surface).
+	TArray<uint32> CachedActiveSlots;
+
+	// ── AllocState readback (head / overflow / live counters) ──────────────
+	FRHIGPUBufferReadback* StateReadback = nullptr;
+	bool                   bStatePending = false;
+	std::atomic<bool>      bStateArmed{ false };
+
+	// ── Collision (GPU gather -> readback -> async cook) ───────────────────
+	FRHIGPUBufferReadback* CollMetaReadback = nullptr;
+	FRHIGPUBufferReadback* CollPosReadback = nullptr;
+	bool                   bCollPending = false;
+	std::atomic<bool>      bCollArmed{ false };
+	bool                   bCollRegionDirty = true;
+	bool                   bCollisionCookInProgress = false;
+	FIntVector             LastCollCenter = FIntVector(MAX_int32, MAX_int32, MAX_int32);
+	uint32                 LastCollSlotCount = 0;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UBodySetup> CollisionBodySetup;
 
-	FBoxSphereBounds LocalBounds = FBoxSphereBounds(FVector::ZeroVector, FVector(1000.0), 1000.0);
-	FIntVector LastTerrainOrigin = FIntVector(MAX_int32, MAX_int32, MAX_int32);
-	FVector LastBuildPlayerPosition = FVector(MAX_flt, MAX_flt, MAX_flt);
-	bool bRebuildRequested = true;
-	bool bCollisionCookInProgress = false;
+	TArray<FVector3f>   CollisionVertices;
+	TArray<FTriIndices> CollisionTriIndices;
+
+	void RebuildCollision();
+	void PollReadbacks();
+
+	FVector LastUpdatePlayerPos = FVector(MAX_dbl, MAX_dbl, MAX_dbl);
 };

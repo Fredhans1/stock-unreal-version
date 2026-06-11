@@ -23,6 +23,7 @@ AFlyCameraPawn::AFlyCameraPawn()
 
 	// Create a floating pawn movement component
 	MovementComponent = CreateDefaultSubobject<UFloatingPawnMovement>(TEXT("MovementComponent"));
+	MovementComponent->SetUpdatedComponent(CameraComponent);
 	MovementComponent->MaxSpeed = 500000.f; // FLY REALLY FAST
 	MovementComponent->Acceleration = 20000.f;
 	MovementComponent->Deceleration = 5000.f;
@@ -33,17 +34,6 @@ AFlyCameraPawn::AFlyCameraPawn()
     // Terrain edit defaults: 500-unit diameter sphere, add mode.
     EditRadius   = 250.0f;
     bSubtractMode = false;
-}
-
-void AFlyCameraPawn::BeginPlay()
-{
-	Super::BeginPlay();
-	UE_LOG(LogTemp, Warning, TEXT("AFlyCameraPawn::BeginPlay called!"));
-}
-
-void AFlyCameraPawn::Tick(float DeltaTime)
-{
-	Super::Tick(DeltaTime);
 }
 
 void AFlyCameraPawn::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
@@ -69,12 +59,16 @@ void AFlyCameraPawn::SetupPlayerInputComponent(UInputComponent* PlayerInputCompo
         }
 	}
 
-    // Hardcoded WASD and Mouse bindings for fallback
-    PlayerInputComponent->BindAxis("MoveForward", this, &AFlyCameraPawn::MoveForward);
-    PlayerInputComponent->BindAxis("MoveRight", this, &AFlyCameraPawn::MoveRight);
-    PlayerInputComponent->BindAxis("MoveUp", this, &AFlyCameraPawn::MoveUpLegacy);
-    PlayerInputComponent->BindAxis("Turn", this, &AFlyCameraPawn::LookYaw);
-    PlayerInputComponent->BindAxis("LookUp", this, &AFlyCameraPawn::LookPitch);
+    // Physical-key fallback. This does not require any entries in
+    // DefaultInput.ini or any Enhanced Input assets on the spawned pawn.
+    PlayerInputComponent->BindAxisKey(EKeys::W, this, &AFlyCameraPawn::MoveForward);
+    PlayerInputComponent->BindAxisKey(EKeys::S, this, &AFlyCameraPawn::MoveBackward);
+    PlayerInputComponent->BindAxisKey(EKeys::D, this, &AFlyCameraPawn::MoveRight);
+    PlayerInputComponent->BindAxisKey(EKeys::A, this, &AFlyCameraPawn::MoveLeft);
+    PlayerInputComponent->BindAxisKey(EKeys::SpaceBar, this, &AFlyCameraPawn::MoveUpDirect);
+    PlayerInputComponent->BindAxisKey(EKeys::LeftControl, this, &AFlyCameraPawn::MoveDown);
+    PlayerInputComponent->BindAxisKey(EKeys::MouseX, this, &AFlyCameraPawn::LookYaw);
+    PlayerInputComponent->BindAxisKey(EKeys::MouseY, this, &AFlyCameraPawn::LookPitch);
 
     // Hardcoded terrain edit keys (bypass Enhanced Input mapping context).
     PlayerInputComponent->BindKey(EKeys::Q,                 IE_Pressed, this, &AFlyCameraPawn::ToggleEditMode);
@@ -165,6 +159,11 @@ void AFlyCameraPawn::MoveForward(float Value)
     }
 }
 
+void AFlyCameraPawn::MoveBackward(float Value)
+{
+	MoveForward(-Value);
+}
+
 void AFlyCameraPawn::MoveRight(float Value)
 {
     if (Value != 0.0f)
@@ -175,12 +174,22 @@ void AFlyCameraPawn::MoveRight(float Value)
     }
 }
 
-void AFlyCameraPawn::MoveUpLegacy(float Value)
+void AFlyCameraPawn::MoveLeft(float Value)
+{
+	MoveRight(-Value);
+}
+
+void AFlyCameraPawn::MoveUpDirect(float Value)
 {
     if (Value != 0.0f)
     {
         AddMovementInput(FVector::UpVector, Value);
     }
+}
+
+void AFlyCameraPawn::MoveDown(float Value)
+{
+	MoveUpDirect(-Value);
 }
 
 void AFlyCameraPawn::LookYaw(float Value)
@@ -190,7 +199,7 @@ void AFlyCameraPawn::LookYaw(float Value)
 
 void AFlyCameraPawn::LookPitch(float Value)
 {
-    AddControllerPitchInput(Value);
+    AddControllerPitchInput(-Value);
 }
 
 void AFlyCameraPawn::Move(const FInputActionValue& Value)

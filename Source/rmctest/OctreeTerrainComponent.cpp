@@ -1,92 +1,451 @@
 #include "OctreeTerrainComponent.h"
 
 #include "Async/Async.h"
-#include "DynamicMeshBuilder.h"
-#include "Engine/CollisionProfile.h"
+#include "Engine/Engine.h"
+#include "Engine/World.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
+#include "GlobalShader.h"
+#include "LocalVertexFactory.h"
 #include "Materials/Material.h"
 #include "Materials/MaterialInterface.h"
-#include "PhysicsEngine/BodySetup.h"
-#include "PrimitiveViewRelevance.h"
+#include "Materials/MaterialRenderProxy.h"
+#include "PrimitiveSceneProxy.h"
+#include "RHICommandList.h"
+#include "RenderGraphBuilder.h"
+#include "RenderGraphUtils.h"
+#include "RenderingThread.h"
 #include "SceneManagement.h"
+#include "ShaderParameterStruct.h"
+
+// ============================================================================
+// Tunables / batch payload
+// ============================================================================
+
+namespace OctreeTerrain
+{
+	constexpr uint32 MaxPoolVerts   = 16u << 20;   // hard pool-growth ceiling (~1 GB of streams)
+	constexpr uint32 CollMaxVerts   = 393216;      // collision gather vertex cap
+	constexpr int32  MaxEdits       = 65536;
+	constexpr int32  MaxLODs        = 10;
+	constexpr uint32 FlagEmpty      = 1u;
+
+	// Everything the render-thread update graph needs, snapshotted on the game
+	// thread so the GPU pipeline never depends on mutable component state.
+	struct FUpdateBatch
+	{
+		bool bInit = false;
+		bool bCompact = false;
+		bool bCollision = false;
+		bool bStateReadback = false;
+		bool bActiveChanged = false;
+
+		uint32 Capacity = 0;
+		uint32 MaxChunks = 0;
+		uint32 GroupsPerAxis = 0;
+		uint32 CellsPerAxis = 0;
+		uint32 MaxVertsPerChunkClamp = 0;
+
+		uint32    NumNoiseLayers = 0;
+		FVector4f Noise[8];
+		float     CaveFreq = 0.0f;
+		float     CaveAmp = 0.0f;
+		float     WorldUVScale = 0.0f;
+		float     ZBandMin = 0.0f;
+		float     ZBandMax = 0.0f;
+
+		TArray<FVector4f>    FinerMin;      // per LOD carve volume
+		TArray<FVector4f>    FinerMax;
+		TArray<FVector4f>    DirtyA;        // xyz = chunk origin, w = cell size
+		TArray<FUintVector4> DirtyB;        // x = slot, y = edit start, z = edit count, w = flags | lod<<8
+		TArray<uint32>       SlotToDirty;   // compaction only
+		TArray<FVector4f>    EditData;
+		TArray<uint32>       EditIdx;
+		TArray<uint32>       CollSlots;
+		TArray<uint32>       ActiveSlots;
+	};
+
+	static int32 PosMod(int32 A, int32 M)
+	{
+		const int32 R = A % M;
+		return R < 0 ? R + M : R;
+	}
+}
+
+// ============================================================================
+// Compute shaders
+// ============================================================================
+
+BEGIN_SHADER_PARAMETER_STRUCT(FOctreeSDFParams, )
+	SHADER_PARAMETER(uint32, NumNoiseLayers)
+	SHADER_PARAMETER_ARRAY(FVector4f, NoiseLayers, [8])
+	SHADER_PARAMETER(float, CaveNoiseFrequency)
+	SHADER_PARAMETER(float, CaveNoiseAmplitude)
+	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, EditSpheres)
+	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, EditIndexList)
+END_SHADER_PARAMETER_STRUCT()
+
+BEGIN_SHADER_PARAMETER_STRUCT(FOctreeChunkParams, )
+	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, DirtyInfoA)
+	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint4>, DirtyInfoB)
+	SHADER_PARAMETER(uint32, DirtyCount)
+	SHADER_PARAMETER(uint32, CellsPerAxis)
+	SHADER_PARAMETER(uint32, GroupsPerAxis)
+	SHADER_PARAMETER_ARRAY(FVector4f, FinerVolMin, [10])
+	SHADER_PARAMETER_ARRAY(FVector4f, FinerVolMax, [10])
+END_SHADER_PARAMETER_STRUCT()
+
+class FOctreeInitPoolCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FOctreeInitPoolCS);
+	SHADER_USE_PARAMETER_STRUCT(FOctreeInitPoolCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, IdentityIndices)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint4>, ChunkAlloc)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, DrawArgs)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, AllocState)
+		SHADER_PARAMETER(uint32, IdentityCount)
+		SHADER_PARAMETER(uint32, MaxChunks)
+	END_SHADER_PARAMETER_STRUCT()
+};
+IMPLEMENT_GLOBAL_SHADER(FOctreeInitPoolCS, "/Project/OctreeTerrainCS.usf", "InitPoolCS", SF_Compute);
+
+class FOctreeCountCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FOctreeCountCS);
+	SHADER_USE_PARAMETER_STRUCT(FOctreeCountCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_STRUCT_INCLUDE(FOctreeSDFParams, SDF)
+		SHADER_PARAMETER_STRUCT_INCLUDE(FOctreeChunkParams, Chunk)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, Counts)
+	END_SHADER_PARAMETER_STRUCT()
+};
+IMPLEMENT_GLOBAL_SHADER(FOctreeCountCS, "/Project/OctreeTerrainCS.usf", "CountCS", SF_Compute);
+
+class FOctreeAllocCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FOctreeAllocCS);
+	SHADER_USE_PARAMETER_STRUCT(FOctreeAllocCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint4>, DirtyInfoB)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, CountsRO)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint4>, ChunkAlloc)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, DrawArgs)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, AllocState)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, MeshSkip)
+		SHADER_PARAMETER(uint32, DirtyCount)
+		SHADER_PARAMETER(uint32, CapacityVerts)
+		SHADER_PARAMETER(uint32, MaxVertsPerChunkClamp)
+	END_SHADER_PARAMETER_STRUCT()
+};
+IMPLEMENT_GLOBAL_SHADER(FOctreeAllocCS, "/Project/OctreeTerrainCS.usf", "AllocCS", SF_Compute);
+
+class FOctreeCompactAllocCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FOctreeCompactAllocCS);
+	SHADER_USE_PARAMETER_STRUCT(FOctreeCompactAllocCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint4>, DirtyInfoB)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, CountsRO)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, SlotToDirty)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint4>, ChunkAlloc)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, DrawArgs)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, AllocState)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, MeshSkip)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OldOffsets)
+		SHADER_PARAMETER(uint32, MaxChunks)
+		SHADER_PARAMETER(uint32, CapacityVerts)
+		SHADER_PARAMETER(uint32, MaxVertsPerChunkClamp)
+	END_SHADER_PARAMETER_STRUCT()
+};
+IMPLEMENT_GLOBAL_SHADER(FOctreeCompactAllocCS, "/Project/OctreeTerrainCS.usf", "CompactAllocCS", SF_Compute);
+
+class FOctreeCopyChunksCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FOctreeCopyChunksCS);
+	SHADER_USE_PARAMETER_STRUCT(FOctreeCopyChunksCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, SlotToDirty)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, OldOffsetsRO)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint4>, ChunkAllocRO)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, SrcPositions)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, SrcTangents)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float2>, SrcUVs)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, SrcColors)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, OutPositions)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, OutTangents)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float2>, OutUVs)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutColors)
+		SHADER_PARAMETER(uint32, MaxChunks)
+	END_SHADER_PARAMETER_STRUCT()
+};
+IMPLEMENT_GLOBAL_SHADER(FOctreeCopyChunksCS, "/Project/OctreeTerrainCS.usf", "CopyChunksCS", SF_Compute);
+
+class FOctreeMeshCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FOctreeMeshCS);
+	SHADER_USE_PARAMETER_STRUCT(FOctreeMeshCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_STRUCT_INCLUDE(FOctreeSDFParams, SDF)
+		SHADER_PARAMETER_STRUCT_INCLUDE(FOctreeChunkParams, Chunk)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint4>, ChunkAllocRO)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, MeshSkipRO)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, Cursors)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, OutPositions)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, OutTangents)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float2>, OutUVs)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutColors)
+		SHADER_PARAMETER(float, WorldUVScale)
+		SHADER_PARAMETER(float, ZBandMin)
+		SHADER_PARAMETER(float, ZBandMax)
+	END_SHADER_PARAMETER_STRUCT()
+};
+IMPLEMENT_GLOBAL_SHADER(FOctreeMeshCS, "/Project/OctreeTerrainCS.usf", "MeshCS", SF_Compute);
+
+class FOctreeCollisionPrefixCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FOctreeCollisionPrefixCS);
+	SHADER_USE_PARAMETER_STRUCT(FOctreeCollisionPrefixCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, CollSlots)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint4>, ChunkAllocRO)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, CollMeta)
+		SHADER_PARAMETER(uint32, CollCount)
+		SHADER_PARAMETER(uint32, CollMaxVerts)
+	END_SHADER_PARAMETER_STRUCT()
+};
+IMPLEMENT_GLOBAL_SHADER(FOctreeCollisionPrefixCS, "/Project/OctreeTerrainCS.usf", "CollisionPrefixCS", SF_Compute);
+
+class FOctreeCollisionCopyCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FOctreeCollisionCopyCS);
+	SHADER_USE_PARAMETER_STRUCT(FOctreeCollisionCopyCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, CollSlots)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint4>, ChunkAllocRO)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, CollMetaRO)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, SrcPositions)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float4>, CollOutPos)
+		SHADER_PARAMETER(uint32, CollCount)
+	END_SHADER_PARAMETER_STRUCT()
+};
+IMPLEMENT_GLOBAL_SHADER(FOctreeCollisionCopyCS, "/Project/OctreeTerrainCS.usf", "CollisionCopyCS", SF_Compute);
+
+// ============================================================================
+// Scene proxy
+// ============================================================================
 
 class FOctreeTerrainSceneProxy final : public FPrimitiveSceneProxy
 {
 public:
-	explicit FOctreeTerrainSceneProxy(const UOctreeTerrainComponent* Component)
-		: FPrimitiveSceneProxy(Component)
-		, Material(Component->TerrainMaterial
-			? Component->TerrainMaterial
-			: UMaterial::GetDefaultMaterial(MD_Surface))
-		, MaterialRelevance(Material->GetRelevance_Concurrent(GetScene().GetShaderPlatform()))
-		, Positions(Component->MeshPositions)
-		, Normals(Component->MeshNormals)
-		, UVs(Component->MeshUVs)
-		, Colors(Component->MeshColors)
-		, Indices(Component->MeshIndices)
+	SIZE_T GetTypeHash() const override
 	{
-	}
-
-	virtual SIZE_T GetTypeHash() const override
-	{
-		static size_t UniquePointer;
+		static SIZE_T UniquePointer;
 		return reinterpret_cast<SIZE_T>(&UniquePointer);
 	}
 
-	virtual void GetDynamicMeshElements(
-		const TArray<const FSceneView*>& Views,
-		const FSceneViewFamily& ViewFamily,
-		uint32 VisibilityMap,
-		FMeshElementCollector& Collector) const override
+	explicit FOctreeTerrainSceneProxy(UOctreeTerrainComponent* InComponent)
+		: FPrimitiveSceneProxy(InComponent)
 	{
-		if (Positions.IsEmpty() || Indices.IsEmpty())
+		Material = InComponent->TerrainMaterial
+			? static_cast<UMaterialInterface*>(InComponent->TerrainMaterial)
+			: UMaterial::GetDefaultMaterial(MD_Surface);
+		MaterialRelevance = Material->GetRelevance_Concurrent(GetScene().GetShaderPlatform());
+		bSupportsGPUScene = true;
+	}
+
+	virtual ~FOctreeTerrainSceneProxy() override
+	{
+		if (VertexFactory)
+		{
+			VertexFactory->ReleaseResource();
+			delete VertexFactory;
+			VertexFactory = nullptr;
+		}
+		PositionBufWrap.ReleaseResource();
+		TangentBufWrap.ReleaseResource();
+		UVBufWrap.ReleaseResource();
+		ColorBufWrap.ReleaseResource();
+		IdentityIndexBufWrap.ReleaseResource();
+	}
+
+	// (Re)points the vertex factory at the current pool buffers. Called on init
+	// and after every pool compaction / growth.
+	void UpdateBuffers_RenderThread(
+		TRefCountPtr<FRDGPooledBuffer> InPos,
+		TRefCountPtr<FRDGPooledBuffer> InTan,
+		TRefCountPtr<FRDGPooledBuffer> InUV,
+		TRefCountPtr<FRDGPooledBuffer> InColor,
+		TRefCountPtr<FRDGPooledBuffer> InIdentity,
+		TRefCountPtr<FRDGPooledBuffer> InArgs,
+		uint32 InCapacity,
+		uint32 InMaxChunks)
+	{
+		check(IsInRenderingThread());
+		if (!InPos.IsValid() || !InIdentity.IsValid() || !InArgs.IsValid())
 		{
 			return;
 		}
 
-		for (int32 ViewIndex = 0; ViewIndex < Views.Num(); ++ViewIndex)
+		FRHICommandListImmediate& RHICmdList = FRHICommandListExecutor::GetImmediateCommandList();
+
+		CurrentPos      = InPos;
+		CurrentTan      = InTan;
+		CurrentUV       = InUV;
+		CurrentColor    = InColor;
+		CurrentIdentity = InIdentity;
+		CurrentArgs     = InArgs;
+		Capacity        = InCapacity;
+		MaxChunks       = InMaxChunks;
+
+		if (!PositionBufWrap.IsInitialized())      PositionBufWrap.InitResource(RHICmdList);
+		if (!TangentBufWrap.IsInitialized())       TangentBufWrap.InitResource(RHICmdList);
+		if (!UVBufWrap.IsInitialized())            UVBufWrap.InitResource(RHICmdList);
+		if (!ColorBufWrap.IsInitialized())         ColorBufWrap.InitResource(RHICmdList);
+		if (!IdentityIndexBufWrap.IsInitialized()) IdentityIndexBufWrap.InitResource(RHICmdList);
+
+		if (!VertexFactory)
 		{
-			if ((VisibilityMap & (1u << ViewIndex)) == 0)
+			VertexFactory = new FLocalVertexFactory(GetScene().GetFeatureLevel(), "FOctreeTerrainSceneProxy");
+		}
+
+		FLocalVertexFactory::FDataType Data;
+		Data.NumTexCoords = 1;
+		Data.LightMapCoordinateIndex = 0;
+		Data.PositionComponent = FVertexStreamComponent(&PositionBufWrap, 0, 16, VET_Float3);
+		Data.TangentBasisComponents[0] = FVertexStreamComponent(&TangentBufWrap, 0, 32, VET_Float4);
+		Data.TangentBasisComponents[1] = FVertexStreamComponent(&TangentBufWrap, 16, 32, VET_Float4);
+		Data.TextureCoordinates.Add(FVertexStreamComponent(&UVBufWrap, 0, 8, VET_Float2));
+		Data.ColorComponent = FVertexStreamComponent(&ColorBufWrap, 0, 4, VET_Color);
+
+		FRHIViewDesc::FBufferSRV::FInitializer PosSRVInit = FRHIViewDesc::CreateBufferSRV();
+		PosSRVInit.SetType(FRHIViewDesc::EBufferType::Typed);
+		PosSRVInit.SetFormat(PF_A32B32G32R32F);
+		PosSRVInit.SetNumElements(Capacity);
+		Data.PositionComponentSRV = RHICmdList.CreateShaderResourceView(InPos->GetRHI(), PosSRVInit);
+
+		FRHIViewDesc::FBufferSRV::FInitializer TanSRVInit = FRHIViewDesc::CreateBufferSRV();
+		TanSRVInit.SetType(FRHIViewDesc::EBufferType::Typed);
+		TanSRVInit.SetFormat(PF_A32B32G32R32F);
+		TanSRVInit.SetNumElements(Capacity * 2);
+		Data.TangentsSRV = RHICmdList.CreateShaderResourceView(InTan->GetRHI(), TanSRVInit);
+
+		FRHIViewDesc::FBufferSRV::FInitializer UVSRVInit = FRHIViewDesc::CreateBufferSRV();
+		UVSRVInit.SetType(FRHIViewDesc::EBufferType::Typed);
+		UVSRVInit.SetFormat(PF_G32R32F);
+		UVSRVInit.SetNumElements(Capacity);
+		Data.TextureCoordinatesSRV = RHICmdList.CreateShaderResourceView(InUV->GetRHI(), UVSRVInit);
+
+		FRHIViewDesc::FBufferSRV::FInitializer ColSRVInit = FRHIViewDesc::CreateBufferSRV();
+		ColSRVInit.SetType(FRHIViewDesc::EBufferType::Typed);
+		ColSRVInit.SetFormat(PF_R8G8B8A8);
+		ColSRVInit.SetNumElements(Capacity);
+		Data.ColorComponentsSRV = RHICmdList.CreateShaderResourceView(InColor->GetRHI(), ColSRVInit);
+
+		VertexFactory->SetData(RHICmdList, Data);
+
+		// Pointer swaps + factory init happen on the RHI timeline so in-flight
+		// draws never see half-updated stream bindings (VoxelMeshComponent's
+		// proven pattern).
+		bBuffersReady = false;
+		RHICmdList.EnqueueLambda(
+			[this,
+			 PosRHI = InPos->GetRHI(),
+			 TanRHI = InTan->GetRHI(),
+			 UVRHI = InUV->GetRHI(),
+			 ColRHI = InColor->GetRHI(),
+			 IdentRHI = InIdentity->GetRHI()](FRHICommandListImmediate& CmdList)
+			{
+				PositionBufWrap.SetBuffer(PosRHI);
+				TangentBufWrap.SetBuffer(TanRHI);
+				UVBufWrap.SetBuffer(UVRHI);
+				ColorBufWrap.SetBuffer(ColRHI);
+				IdentityIndexBufWrap.SetBuffer(IdentRHI);
+
+				if (!VertexFactory->IsInitialized())
+				{
+					VertexFactory->InitResource(CmdList);
+				}
+				else
+				{
+					VertexFactory->UpdateRHI(CmdList);
+				}
+
+				bBuffersReady = true;
+			});
+	}
+
+	void SetActiveSlots_RenderThread(TArray<uint32> InActiveSlots)
+	{
+		check(IsInRenderingThread());
+		ActiveSlots = MoveTemp(InActiveSlots);
+	}
+
+	virtual void GetDynamicMeshElements(const TArray<const FSceneView*>& Views,
+		const FSceneViewFamily& ViewFamily, uint32 VisibilityMap,
+		FMeshElementCollector& Collector) const override
+	{
+		if (!bBuffersReady || !VertexFactory || !VertexFactory->IsInitialized() ||
+			!CurrentArgs.IsValid() || ActiveSlots.Num() == 0)
+		{
+			return;
+		}
+
+		FMaterialRenderProxy* MaterialProxy = Material->GetRenderProxy();
+		if (!MaterialProxy)
+		{
+			return;
+		}
+
+		for (int32 ViewIndex = 0; ViewIndex < Views.Num(); ViewIndex++)
+		{
+			if (!(VisibilityMap & (1 << ViewIndex)))
 			{
 				continue;
 			}
 
-			FDynamicMeshBuilder MeshBuilder(ViewFamily.GetFeatureLevel());
-			MeshBuilder.ReserveVertices(Positions.Num());
-			MeshBuilder.ReserveTriangles(Indices.Num() / 3);
+			FMeshBatch& Mesh = Collector.AllocateMesh();
+			Mesh.bWireframe = false;
+			Mesh.VertexFactory = VertexFactory;
+			Mesh.MaterialRenderProxy = MaterialProxy;
+			Mesh.ReverseCulling = IsLocalToWorldDeterminantNegative();
+			Mesh.Type = PT_TriangleList;
+			Mesh.DepthPriorityGroup = GetDepthPriorityGroup(Views[ViewIndex]);
+			Mesh.bCanApplyViewModeOverrides = true;
+			Mesh.bDisableBackfaceCulling = true;
 
-			for (int32 VertexIndex = 0; VertexIndex < Positions.Num(); ++VertexIndex)
+			// One indirect draw per active chunk. Inactive / empty chunks have
+			// IndexCount 0 in their args and cost nothing on the GPU.
+			for (int32 i = 0; i < ActiveSlots.Num(); i++)
 			{
-				const FVector3f Normal = Normals.IsValidIndex(VertexIndex)
-					? Normals[VertexIndex]
-					: FVector3f::UpVector;
-				FVector3f TangentX = FVector3f::CrossProduct(FVector3f::YAxisVector, Normal);
-				if (!TangentX.Normalize())
-				{
-					TangentX = FVector3f::XAxisVector;
-				}
-				const FVector3f TangentY =
-					FVector3f::CrossProduct(Normal, TangentX).GetSafeNormal();
-
-				MeshBuilder.AddVertex(
-					Positions[VertexIndex],
-					UVs.IsValidIndex(VertexIndex) ? UVs[VertexIndex] : FVector2f::ZeroVector,
-					TangentX,
-					TangentY,
-					Normal,
-					Colors.IsValidIndex(VertexIndex) ? Colors[VertexIndex] : FColor::White);
+				FMeshBatchElement& BatchElement = (i == 0) ? Mesh.Elements[0] : Mesh.Elements.AddDefaulted_GetRef();
+				BatchElement.IndexBuffer = &IdentityIndexBufWrap;
+				BatchElement.IndirectArgsBuffer = CurrentArgs->GetRHI();
+				BatchElement.IndirectArgsOffset = ActiveSlots[i] * 8 * sizeof(uint32);
+				BatchElement.FirstIndex = 0;
+				BatchElement.NumPrimitives = 0;   // must be 0 when using IndirectArgsBuffer
+				BatchElement.BaseVertexIndex = 0; // args carry the real BaseVertexLocation
+				BatchElement.MinVertexIndex = 0;
+				BatchElement.MaxVertexIndex = Capacity > 0 ? Capacity - 1 : 0;
 			}
 
-			MeshBuilder.AddTriangles(Indices);
-			MeshBuilder.GetMesh(
-				GetLocalToWorld(),
-				Material->GetRenderProxy(),
-				GetDepthPriorityGroup(Views[ViewIndex]),
-				false,
-				true,
-				ViewIndex,
-				Collector);
+			Collector.AddMesh(ViewIndex, Mesh);
 		}
 	}
 
@@ -96,471 +455,1109 @@ public:
 		Result.bDrawRelevance = IsShown(View);
 		Result.bShadowRelevance = IsShadowCast(View);
 		Result.bDynamicRelevance = true;
+		Result.bStaticRelevance = false;
 		Result.bRenderInMainPass = ShouldRenderInMainPass();
-		Result.bUsesLightingChannels =
-			GetLightingChannelMask() != GetDefaultLightingChannelMask();
+		Result.bUsesLightingChannels = GetLightingChannelMask() != GetDefaultLightingChannelMask();
 		Result.bRenderCustomDepth = ShouldRenderCustomDepth();
 		MaterialRelevance.SetPrimitiveViewRelevance(Result);
 		return Result;
 	}
 
-	virtual uint32 GetMemoryFootprint() const override
-	{
-		return sizeof(*this) + GetAllocatedSize();
-	}
-
-	uint32 GetAllocatedSize() const
-	{
-		return static_cast<uint32>(
-			Positions.GetAllocatedSize()
-			+ Normals.GetAllocatedSize()
-			+ UVs.GetAllocatedSize()
-			+ Colors.GetAllocatedSize()
-			+ Indices.GetAllocatedSize());
-	}
+	virtual uint32 GetMemoryFootprint() const override { return sizeof(*this) + GetAllocatedSize(); }
 
 private:
-	UMaterialInterface* Material = nullptr;
-	FMaterialRelevance MaterialRelevance;
-	TArray<FVector3f> Positions;
-	TArray<FVector3f> Normals;
-	TArray<FVector2f> UVs;
-	TArray<FColor> Colors;
-	TArray<uint32> Indices;
+	friend class UOctreeTerrainComponent;
+
+	class FPooledVertexBuffer : public FVertexBuffer
+	{
+	public:
+		virtual void InitRHI(FRHICommandListBase&) override {}
+		void SetBuffer(FRHIBuffer* InBuffer) { VertexBufferRHI = InBuffer; }
+	};
+	class FPooledIndexBuffer : public FIndexBuffer
+	{
+	public:
+		virtual void InitRHI(FRHICommandListBase&) override {}
+		void SetBuffer(FRHIBuffer* InBuffer) { IndexBufferRHI = InBuffer; }
+	};
+
+	bool bBuffersReady = false;
+
+	TRefCountPtr<FRDGPooledBuffer> CurrentPos;
+	TRefCountPtr<FRDGPooledBuffer> CurrentTan;
+	TRefCountPtr<FRDGPooledBuffer> CurrentUV;
+	TRefCountPtr<FRDGPooledBuffer> CurrentColor;
+	TRefCountPtr<FRDGPooledBuffer> CurrentIdentity;
+	TRefCountPtr<FRDGPooledBuffer> CurrentArgs;
+
+	uint32 Capacity = 0;
+	uint32 MaxChunks = 0;
+	TArray<uint32> ActiveSlots;
+
+	FPooledVertexBuffer PositionBufWrap;
+	FPooledVertexBuffer TangentBufWrap;
+	FPooledVertexBuffer UVBufWrap;
+	FPooledVertexBuffer ColorBufWrap;
+	FPooledIndexBuffer  IdentityIndexBufWrap;
+
+	FLocalVertexFactory* VertexFactory = nullptr;
+	UMaterialInterface*  Material = nullptr;
+	FMaterialRelevance   MaterialRelevance;
 };
+
+// ============================================================================
+// Component: setup
+// ============================================================================
 
 UOctreeTerrainComponent::UOctreeTerrainComponent()
 {
 	PrimaryComponentTick.bCanEverTick = true;
 	PrimaryComponentTick.TickGroup = TG_PrePhysics;
 
-	SetCollisionProfileName(UCollisionProfile::BlockAll_ProfileName);
-	SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
-	SetCollisionObjectType(ECC_WorldStatic);
-
 	CastShadow = true;
 	bCastDynamicShadow = true;
 	bCastStaticShadow = false;
-	bUseAsOccluder = true;
-	bAffectDynamicIndirectLighting = true;
-	bAffectDistanceFieldLighting = false;
+	bUseAsOccluder = false;
+	SetCullDistance(0.0f);
+
+	SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+	SetCollisionObjectType(ECC_WorldStatic);
+	SetCollisionResponseToAllChannels(ECR_Block);
+}
+
+double UOctreeTerrainComponent::ChunkSizeForLOD(int32 LOD) const
+{
+	return double(BaseChunkSize) * double(1 << LOD);
+}
+
+void UOctreeTerrainComponent::SanitizeConfig()
+{
+	GridResolution = FMath::Clamp(GridResolution, 8, 64);
+	CellsN = (GridResolution / 8) * 8;            // multiple of 8 (also keeps N even for carve alignment)
+	NumLODLevels = FMath::Clamp(NumLODLevels, 1, OctreeTerrain::MaxLODs);
+	ChunksPerSide = FMath::Clamp(ChunksPerSide, 3, 21);
+	ChunksVertical = FMath::Clamp(ChunksVertical, 1, 13);
+
+	ChunksPerLOD = ChunksPerSide * ChunksPerSide * ChunksVertical;
+	MaxChunks = ChunksPerLOD * NumLODLevels;
+
+	const uint64 WorstVerts = uint64(CellsN) * CellsN * CellsN * 15;
+	MaxVertsPerChunkClamp = uint32(FMath::Min<uint64>(WorstVerts, 4 * 1024 * 1024));
+
+	CurrentCapacity = FMath::Clamp<uint32>(uint32(InitialPoolVertexCapacity), 65536u, OctreeTerrain::MaxPoolVerts);
+}
+
+void UOctreeTerrainComponent::EnsureNoiseDefaults()
+{
+	if (NoiseLayers.Num() == 0)
+	{
+		auto AddLayer = [this](float Frequency, float Amplitude)
+		{
+			FOctreeNoiseLayer& Layer = NoiseLayers.AddDefaulted_GetRef();
+			Layer.Frequency = Frequency;
+			Layer.Amplitude = Amplitude;
+		};
+		AddLayer(0.00002f, 30000.0f);
+		AddLayer(0.0001f, 8000.0f);
+		AddLayer(0.0008f, 1500.0f);
+		AddLayer(0.005f, 250.0f);
+	}
+	while (NoiseLayers.Num() > 8)
+	{
+		NoiseLayers.Pop();
+	}
+
+	double AmpSum = double(CaveNoiseAmplitude);
+	for (const FOctreeNoiseLayer& L : NoiseLayers)
+	{
+		AmpSum += FMath::Abs(L.Amplitude);
+	}
+	const double Margin = 4.0 * ChunkSizeForLOD(NumLODLevels - 1) / double(CellsN);
+	ZBandMax = AmpSum + Margin;
+	ZBandMin = -ZBandMax;
 }
 
 void UOctreeTerrainComponent::BeginPlay()
 {
 	Super::BeginPlay();
-	RebuildTerrain();
+
+	SanitizeConfig();
+	EnsureNoiseDefaults();
+
+	SlotCoord.Init(FIntVector(MAX_int32, MAX_int32, MAX_int32), MaxChunks);
+	SlotActive.Init(0, MaxChunks);
+	RingOrigin.Init(FIntVector::ZeroValue, NumLODLevels);
+	bForceAllDirty = true;
+	bCollRegionDirty = true;
+
+	UE_LOG(LogTemp, Log,
+		TEXT("OctreeTerrain: %d slots (%d LODs x %d), %d cells/axis, pool %u verts (%.1f MB streams)"),
+		MaxChunks, NumLODLevels, ChunksPerLOD, CellsN, CurrentCapacity,
+		double(CurrentCapacity) * 60.0 / (1024.0 * 1024.0));
+
+	const FVector PlayerPos = GetPlayerPosition();
+	LastUpdatePlayerPos = PlayerPos;
+	BuildAndEnqueueUpdate(PlayerPos);
 }
 
-void UOctreeTerrainComponent::TickComponent(
-	float DeltaTime,
-	ELevelTick TickType,
-	FActorComponentTickFunction* ThisTickFunction)
+void UOctreeTerrainComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
-	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+	FlushRenderingCommands();
 
-	const FVector PlayerPosition = GetPlayerPosition();
-	const float SmallestChunk = FMath::Max(100.0f, BaseChunkSize);
-	const FIntVector TerrainOrigin(
-		FMath::FloorToInt(PlayerPosition.X / SmallestChunk),
-		FMath::FloorToInt(PlayerPosition.Y / SmallestChunk),
-		0);
+	delete StateReadback;    StateReadback = nullptr;
+	delete CollMetaReadback; CollMetaReadback = nullptr;
+	delete CollPosReadback;  CollPosReadback = nullptr;
+	bStatePending = false;
+	bCollPending = false;
 
-	const bool bMovedChunk = TerrainOrigin != LastTerrainOrigin;
-	const bool bMovedThreshold =
-		FVector::DistSquared2D(PlayerPosition, LastBuildPlayerPosition)
-		>= FMath::Square(UpdateThreshold);
-
-	if (bRebuildRequested || bMovedChunk || bMovedThreshold)
-	{
-		BuildTerrainMesh(PlayerPosition);
-		LastTerrainOrigin = TerrainOrigin;
-		LastBuildPlayerPosition = PlayerPosition;
-		bRebuildRequested = false;
-		MarkRenderStateDirty();
-		RebuildCollision();
-	}
-}
-
-void UOctreeTerrainComponent::ApplySphereEdit(
-	FVector Center,
-	float Radius,
-	bool bSubtract)
-{
-	if (Radius <= UE_KINDA_SMALL_NUMBER)
-	{
-		return;
-	}
-
-	FSphereEdit& Edit = SphereEdits.AddDefaulted_GetRef();
-	Edit.Center = Center;
-	Edit.Radius = Radius;
-	Edit.bSubtract = bSubtract;
-	bRebuildRequested = true;
-}
-
-void UOctreeTerrainComponent::ClearAllEdits()
-{
-	SphereEdits.Reset();
-	bRebuildRequested = true;
-}
-
-void UOctreeTerrainComponent::RebuildTerrain()
-{
-	bRebuildRequested = true;
+	Super::EndPlay(EndPlayReason);
 }
 
 FVector UOctreeTerrainComponent::GetPlayerPosition() const
 {
-	if (const UWorld* World = GetWorld())
+	if (UWorld* World = GetWorld())
 	{
-		if (const APlayerController* Controller = World->GetFirstPlayerController())
+		if (APlayerController* PC = World->GetFirstPlayerController())
 		{
-			if (const APawn* Pawn = Controller->GetPawn())
+			if (APawn* Pawn = PC->GetPawn())
 			{
 				return Pawn->GetActorLocation();
 			}
 		}
 	}
-	return GetComponentLocation();
+	return FVector::ZeroVector;
 }
 
-float UOctreeTerrainComponent::SampleHeight(double WorldX, double WorldY) const
+FBoxSphereBounds UOctreeTerrainComponent::CalcBounds(const FTransform& LocalToWorld) const
 {
-	const float Frequency = FMath::Max(NoiseFrequency, 0.000001f);
-	float Amplitude = HeightScale;
-	float CurrentFrequency = Frequency;
-	float Height = 0.0f;
-	float Weight = 0.0f;
-
-	for (int32 Octave = 0; Octave < FMath::Clamp(NoiseOctaves, 1, 8); ++Octave)
-	{
-		const FVector2D Point(WorldX * CurrentFrequency, WorldY * CurrentFrequency);
-		Height += FMath::PerlinNoise2D(Point) * Amplitude;
-		Weight += Amplitude;
-		CurrentFrequency *= 2.03f;
-		Amplitude *= 0.5f;
-	}
-
-	if (Weight > UE_KINDA_SMALL_NUMBER)
-	{
-		Height *= HeightScale / Weight;
-	}
-
-	if (CaveNoiseFrequency > 0.0f && CaveNoiseAmplitude > 0.0f)
-	{
-		Height += FMath::PerlinNoise2D(FVector2D(
-			WorldX * CaveNoiseFrequency,
-			WorldY * CaveNoiseFrequency)) * CaveNoiseAmplitude;
-	}
-
-	for (const FSphereEdit& Edit : SphereEdits)
-	{
-		const double DX = WorldX - Edit.Center.X;
-		const double DY = WorldY - Edit.Center.Y;
-		const double HorizontalDistanceSquared = DX * DX + DY * DY;
-		const double RadiusSquared = FMath::Square(static_cast<double>(Edit.Radius));
-		if (HorizontalDistanceSquared >= RadiusSquared)
-		{
-			continue;
-		}
-
-		const float VerticalExtent = static_cast<float>(
-			FMath::Sqrt(RadiusSquared - HorizontalDistanceSquared));
-		const float SphereTop = Edit.Center.Z + VerticalExtent;
-		const float SphereBottom = Edit.Center.Z - VerticalExtent;
-		Height = Edit.bSubtract
-			? FMath::Min(Height, SphereBottom)
-			: FMath::Max(Height, SphereTop);
-	}
-
-	return Height;
+	// Geometry follows the player far from the component origin; use generous
+	// static bounds like VoxelMeshComponent so chunks never get culled away.
+	return FBoxSphereBounds(FVector::ZeroVector, FVector(5000000.0f), 5000000.0f);
 }
 
-FVector3f UOctreeTerrainComponent::SampleNormal(
-	double WorldX,
-	double WorldY,
-	double Step) const
+void UOctreeTerrainComponent::GetUsedMaterials(TArray<UMaterialInterface*>& OutMaterials, bool bGetDebugMaterials) const
 {
-	const float HeightLeft = SampleHeight(WorldX - Step, WorldY);
-	const float HeightRight = SampleHeight(WorldX + Step, WorldY);
-	const float HeightDown = SampleHeight(WorldX, WorldY - Step);
-	const float HeightUp = SampleHeight(WorldX, WorldY + Step);
-	return FVector3f(
-		HeightLeft - HeightRight,
-		HeightDown - HeightUp,
-		static_cast<float>(2.0 * Step)).GetSafeNormal();
-}
-
-void UOctreeTerrainComponent::BuildTerrainMesh(const FVector& PlayerPosition)
-{
-	MeshPositions.Reset();
-	MeshNormals.Reset();
-	MeshUVs.Reset();
-	MeshColors.Reset();
-	MeshIndices.Reset();
-	CollisionVertices.Reset();
-	CollisionTriangles.Reset();
-
-	const int32 Resolution = FMath::Clamp(GridResolution, 4, 64);
-	const int32 SideCount = FMath::Clamp(ChunksPerSide, 3, 21) | 1;
-	const int32 HalfSide = SideCount / 2;
-	const int32 LODCount = FMath::Clamp(NumLODLevels, 1, 8);
-	const int32 CollisionStride = FMath::Max(1, CollisionDownsampleFactor);
-
-	FBox TerrainBounds(EForceInit::ForceInit);
-
-	for (int32 LOD = 0; LOD < LODCount; ++LOD)
-	{
-		const float ChunkSize = BaseChunkSize * static_cast<float>(1 << LOD);
-		const int32 CenterChunkX = FMath::FloorToInt(PlayerPosition.X / ChunkSize);
-		const int32 CenterChunkY = FMath::FloorToInt(PlayerPosition.Y / ChunkSize);
-
-		for (int32 LocalY = -HalfSide; LocalY <= HalfSide; ++LocalY)
-		{
-			for (int32 LocalX = -HalfSide; LocalX <= HalfSide; ++LocalX)
-			{
-				if (LOD > 0)
-				{
-					const int32 InnerHalf = FMath::Max(1, HalfSide / 2);
-					if (FMath::Abs(LocalX) <= InnerHalf && FMath::Abs(LocalY) <= InnerHalf)
-					{
-						continue;
-					}
-				}
-
-				const int32 ChunkX = CenterChunkX + LocalX;
-				const int32 ChunkY = CenterChunkY + LocalY;
-				const FVector2D Origin(ChunkX * ChunkSize, ChunkY * ChunkSize);
-				const bool bBuildCollision =
-					LOD == 0
-					&& (LocalX % CollisionStride) == 0
-					&& (LocalY % CollisionStride) == 0;
-
-				const int32 StartVertex = MeshPositions.Num();
-				AppendChunk(
-					LOD,
-					ChunkX,
-					ChunkY,
-					Origin,
-					ChunkSize,
-					Resolution,
-					bBuildCollision);
-
-				for (int32 VertexIndex = StartVertex; VertexIndex < MeshPositions.Num(); ++VertexIndex)
-				{
-					TerrainBounds += FVector(MeshPositions[VertexIndex]);
-				}
-			}
-		}
-	}
-
-	if (TerrainBounds.IsValid)
-	{
-		LocalBounds = FBoxSphereBounds(TerrainBounds);
-	}
-	else
-	{
-		LocalBounds = FBoxSphereBounds(FVector::ZeroVector, FVector(1000.0), 1000.0);
-	}
-
-	UpdateBounds();
-}
-
-void UOctreeTerrainComponent::AppendChunk(
-	int32 LOD,
-	int32 ChunkX,
-	int32 ChunkY,
-	const FVector2D& ChunkOrigin,
-	float ChunkSize,
-	int32 Resolution,
-	bool bBuildCollision)
-{
-	const int32 FirstVertex = MeshPositions.Num();
-	const int32 VerticesPerSide = Resolution + 1;
-	const double Step = ChunkSize / static_cast<double>(Resolution);
-	const FTransform ComponentTransform = GetComponentTransform();
-
-	for (int32 Y = 0; Y <= Resolution; ++Y)
-	{
-		for (int32 X = 0; X <= Resolution; ++X)
-		{
-			const double WorldX = ChunkOrigin.X + X * Step;
-			const double WorldY = ChunkOrigin.Y + Y * Step;
-			const float WorldZ = SampleHeight(WorldX, WorldY);
-			const FVector WorldPosition(WorldX, WorldY, WorldZ);
-			const FVector LocalPosition =
-				ComponentTransform.InverseTransformPosition(WorldPosition);
-			const FVector WorldNormal = FVector(SampleNormal(WorldX, WorldY, Step));
-			const FVector LocalNormal =
-				ComponentTransform.InverseTransformVectorNoScale(WorldNormal).GetSafeNormal();
-
-			MeshPositions.Add(FVector3f(LocalPosition));
-			MeshNormals.Add(FVector3f(LocalNormal));
-			MeshUVs.Add(FVector2f(
-				static_cast<float>(WorldX / BaseChunkSize),
-				static_cast<float>(WorldY / BaseChunkSize)));
-
-			const float NormalizedHeight = FMath::Clamp(
-				(WorldZ / FMath::Max(HeightScale, 1.0f) + 1.0f) * 0.5f,
-				0.0f,
-				1.0f);
-			MeshColors.Add(FColor(
-				static_cast<uint8>(FMath::RoundToInt(NormalizedHeight * 255.0f)),
-				static_cast<uint8>(LOD * 32),
-				128,
-				255));
-		}
-	}
-
-	for (int32 Y = 0; Y < Resolution; ++Y)
-	{
-		for (int32 X = 0; X < Resolution; ++X)
-		{
-			const uint32 I0 = FirstVertex + Y * VerticesPerSide + X;
-			const uint32 I1 = I0 + 1;
-			const uint32 I2 = I0 + VerticesPerSide;
-			const uint32 I3 = I2 + 1;
-			MeshIndices.Append({ I0, I3, I1, I0, I2, I3 });
-
-			if (bBuildCollision)
-			{
-				const int32 CollisionBase = CollisionVertices.Num();
-				CollisionVertices.Append({
-					MeshPositions[I0],
-					MeshPositions[I1],
-					MeshPositions[I2],
-					MeshPositions[I3]
-				});
-
-				FTriIndices TriangleA;
-				TriangleA.v0 = CollisionBase;
-				TriangleA.v1 = CollisionBase + 3;
-				TriangleA.v2 = CollisionBase + 1;
-				CollisionTriangles.Add(TriangleA);
-
-				FTriIndices TriangleB;
-				TriangleB.v0 = CollisionBase;
-				TriangleB.v1 = CollisionBase + 2;
-				TriangleB.v2 = CollisionBase + 3;
-				CollisionTriangles.Add(TriangleB);
-			}
-		}
-	}
-
-	if (SkirtDepth > 0.0f)
-	{
-		AppendSkirts(FirstVertex, Resolution, SkirtDepth * static_cast<float>(1 << LOD));
-	}
-}
-
-void UOctreeTerrainComponent::AppendSkirts(
-	int32 FirstVertex,
-	int32 Resolution,
-	float Depth)
-{
-	const int32 VerticesPerSide = Resolution + 1;
-	TArray<int32> Boundary;
-	Boundary.Reserve(Resolution * 4);
-
-	for (int32 X = 0; X < Resolution; ++X)
-	{
-		Boundary.Add(FirstVertex + X);
-	}
-	for (int32 Y = 0; Y < Resolution; ++Y)
-	{
-		Boundary.Add(FirstVertex + Y * VerticesPerSide + Resolution);
-	}
-	for (int32 X = Resolution; X > 0; --X)
-	{
-		Boundary.Add(FirstVertex + Resolution * VerticesPerSide + X);
-	}
-	for (int32 Y = Resolution; Y > 0; --Y)
-	{
-		Boundary.Add(FirstVertex + Y * VerticesPerSide);
-	}
-
-	const int32 SkirtStart = MeshPositions.Num();
-	for (const int32 SourceIndex : Boundary)
-	{
-		FVector3f Position = MeshPositions[SourceIndex];
-		const FVector3f Normal = MeshNormals[SourceIndex];
-		const FVector2f UV = MeshUVs[SourceIndex];
-		const FColor Color = MeshColors[SourceIndex];
-		Position.Z -= Depth;
-		MeshPositions.Add(Position);
-		MeshNormals.Add(Normal);
-		MeshUVs.Add(UV);
-		MeshColors.Add(Color);
-	}
-
-	for (int32 Index = 0; Index < Boundary.Num(); ++Index)
-	{
-		const int32 Next = (Index + 1) % Boundary.Num();
-		const uint32 Top0 = Boundary[Index];
-		const uint32 Top1 = Boundary[Next];
-		const uint32 Bottom0 = SkirtStart + Index;
-		const uint32 Bottom1 = SkirtStart + Next;
-		MeshIndices.Append({ Top0, Top1, Bottom1, Top0, Bottom1, Bottom0 });
-	}
-}
-
-FPrimitiveSceneProxy* UOctreeTerrainComponent::CreateSceneProxy()
-{
-	return MeshPositions.IsEmpty()
-		? nullptr
-		: new FOctreeTerrainSceneProxy(this);
-}
-
-FBoxSphereBounds UOctreeTerrainComponent::CalcBounds(
-	const FTransform& LocalToWorld) const
-{
-	return LocalBounds.TransformBy(LocalToWorld);
-}
-
-void UOctreeTerrainComponent::GetUsedMaterials(
-	TArray<UMaterialInterface*>& OutMaterials,
-	bool bGetDebugMaterials) const
-{
+	Super::GetUsedMaterials(OutMaterials, bGetDebugMaterials);
 	if (TerrainMaterial)
 	{
 		OutMaterials.Add(TerrainMaterial);
 	}
 }
 
-UBodySetup* UOctreeTerrainComponent::GetBodySetup()
+FPrimitiveSceneProxy* UOctreeTerrainComponent::CreateSceneProxy()
 {
-	return CollisionBodySetup;
-}
+	FOctreeTerrainSceneProxy* Proxy = new FOctreeTerrainSceneProxy(this);
 
-bool UOctreeTerrainComponent::GetPhysicsTriMeshData(
-	FTriMeshCollisionData* CollisionData,
-	bool InUseAllTriData)
-{
-	if (CollisionVertices.IsEmpty() || CollisionTriangles.IsEmpty())
+	// If the GPU buffers already exist (proxy recreation after a render-state
+	// change), hand them straight to the new proxy.
+	if (PoolPos.IsValid() && PoolArgs.IsValid() && PoolIdentity.IsValid())
 	{
-		return false;
+		ENQUEUE_RENDER_COMMAND(OctreeRestoreBuffers)(
+			[Proxy,
+			 Pos = PoolPos, Tan = PoolTan, UV = PoolUV, Col = PoolColor,
+			 Ident = PoolIdentity, Args = PoolArgs,
+			 Capacity = CurrentCapacity, NumChunks = uint32(MaxChunks),
+			 Slots = CachedActiveSlots](FRHICommandListImmediate& RHICmdList) mutable
+			{
+				Proxy->UpdateBuffers_RenderThread(Pos, Tan, UV, Col, Ident, Args, Capacity, NumChunks);
+				Proxy->SetActiveSlots_RenderThread(MoveTemp(Slots));
+			});
 	}
 
-	CollisionData->Vertices = CollisionVertices;
-	CollisionData->Indices = CollisionTriangles;
-	CollisionData->MaterialIndices.SetNumZeroed(CollisionTriangles.Num());
-	CollisionData->bFastCook = true;
-	CollisionData->bFlipNormals = false;
-	return true;
+	return Proxy;
 }
 
-bool UOctreeTerrainComponent::ContainsPhysicsTriMeshData(
-	bool InUseAllTriData) const
+// ============================================================================
+// Component: edit API
+// ============================================================================
+
+void UOctreeTerrainComponent::ApplySphereEdit(FVector Center, float Radius, bool bSubtract)
 {
-	return !CollisionVertices.IsEmpty() && !CollisionTriangles.IsEmpty();
+	if (Radius <= 0.0f)
+	{
+		return;
+	}
+	if (Edits.Num() >= OctreeTerrain::MaxEdits)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("OctreeTerrain: edit limit (%d) reached, ignoring edit"), OctreeTerrain::MaxEdits);
+		return;
+	}
+
+	Edits.Add(FVector4f(float(Center.X), float(Center.Y), float(Center.Z), bSubtract ? -Radius : Radius));
+	NumPendingEdits++;
+}
+
+void UOctreeTerrainComponent::ClearAllEdits()
+{
+	Edits.Empty();
+	NumPendingEdits = 0;
+	bForceAllDirty = true;
+}
+
+void UOctreeTerrainComponent::RebuildTerrain()
+{
+	bForceAllDirty = true;
+}
+
+// ============================================================================
+// Component: tick / dirty tracking
+// ============================================================================
+
+void UOctreeTerrainComponent::TickComponent(float DeltaTime, ELevelTick TickType,
+	FActorComponentTickFunction* ThisTickFunction)
+{
+	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+
+	PollReadbacks();
+
+	if (!bGPUInitialized)
+	{
+		return;
+	}
+
+	// A collision refresh may still be owed from a tick where the cook or a
+	// readback was busy.
+	if (bCollRegionDirty && !bCollPending && !bCollisionCookInProgress)
+	{
+		bUpdateRequested = true;
+	}
+
+	const FVector PlayerPos = GetPlayerPosition();
+	const bool bMoved = FVector::Dist(PlayerPos, LastUpdatePlayerPos) > UpdateThreshold;
+
+	if (bMoved || NumPendingEdits > 0 || bForceAllDirty || bUpdateRequested)
+	{
+		bUpdateRequested = false;
+		LastUpdatePlayerPos = PlayerPos;
+		BuildAndEnqueueUpdate(PlayerPos);
+	}
+}
+
+FBox UOctreeTerrainComponent::ChunkBox(const FIntVector& Coord, int32 LOD) const
+{
+	const double S = ChunkSizeForLOD(LOD);
+	const FVector Min(Coord.X * S, Coord.Y * S, Coord.Z * S);
+	return FBox(Min, Min + FVector(S));
+}
+
+FBox UOctreeTerrainComponent::FinerRingBox(const FIntVector& Origin, int32 FinerLOD) const
+{
+	const double S = ChunkSizeForLOD(FinerLOD);
+	const FVector Min(Origin.X * S, Origin.Y * S, Origin.Z * S);
+	return FBox(Min, Min + FVector(ChunksPerSide * S, ChunksPerSide * S, ChunksVertical * S));
+}
+
+bool UOctreeTerrainComponent::ChunkMayHaveSurface(const FIntVector& Coord, int32 LOD) const
+{
+	const double S = ChunkSizeForLOD(LOD);
+	const double Z0 = Coord.Z * S;
+	if (Z0 + S >= ZBandMin && Z0 <= ZBandMax)
+	{
+		return true;
+	}
+
+	// Outside the noise height band - only an edit can put surface here.
+	const FBox Box = ChunkBox(Coord, LOD).ExpandBy(4.0 * S / double(CellsN));
+	for (const FVector4f& E : Edits)
+	{
+		const double R = FMath::Abs(double(E.W));
+		const FVector C(E.X, E.Y, E.Z);
+		if (Box.Intersect(FBox(C - FVector(R), C + FVector(R))))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+void UOctreeTerrainComponent::HandleAllocState(uint32 Head, uint32 Overflow, uint32 TotalLive)
+{
+	const uint64 Cap = CurrentCapacity;
+
+	if (Overflow)
+	{
+		// Some chunks were skipped (or dropped during a compaction). Grow the
+		// pool and rebuild everything - rare, self-healing path.
+		bWantCompact = true;
+		PendingNewCapacity = uint32(FMath::Min<uint64>(OctreeTerrain::MaxPoolVerts,
+			FMath::Max<uint64>(Cap * 2, uint64(TotalLive) * 3 / 2)));
+		bForceAllDirty = true;
+		bUpdateRequested = true;
+		UE_LOG(LogTemp, Warning, TEXT("OctreeTerrain: vertex pool overflow (live=%u cap=%llu) - growing to %u"),
+			TotalLive, Cap, PendingNewCapacity);
+	}
+	else if (TotalLive > Cap * 7 / 10 && Cap < OctreeTerrain::MaxPoolVerts)
+	{
+		bWantCompact = true;
+		PendingNewCapacity = uint32(FMath::Min<uint64>(OctreeTerrain::MaxPoolVerts, Cap * 2));
+		bUpdateRequested = true;
+		UE_LOG(LogTemp, Log, TEXT("OctreeTerrain: pool growth (live=%u cap=%llu -> %u)"),
+			TotalLive, Cap, PendingNewCapacity);
+	}
+	else if (Head > Cap * 85 / 100)
+	{
+		// Bump-allocator garbage from re-meshed chunks is piling up - compact in
+		// place (same capacity).
+		bWantCompact = true;
+		PendingNewCapacity = 0;
+		bUpdateRequested = true;
+	}
+}
+
+// ============================================================================
+// Component: update graph
+// ============================================================================
+
+void UOctreeTerrainComponent::BuildAndEnqueueUpdate(const FVector& PlayerPos)
+{
+	using namespace OctreeTerrain;
+
+	const int32 CPS = ChunksPerSide;
+	const int32 CV = ChunksVertical;
+
+	FUpdateBatch B;
+	B.bInit = !bGPUInitialized;
+	B.bCompact = bWantCompact && !B.bInit;
+	const bool bForceAll = bForceAllDirty || B.bInit;
+
+	if (B.bCompact && PendingNewCapacity > CurrentCapacity)
+	{
+		CurrentCapacity = FMath::Min(PendingNewCapacity, MaxPoolVerts);
+	}
+	bWantCompact = false;
+	PendingNewCapacity = 0;
+	bForceAllDirty = false;
+
+	// ── 1. Ring origins per LOD (snapped to that LOD's chunk grid) ─────────
+	TArray<FIntVector> NewRing;
+	NewRing.SetNum(NumLODLevels);
+	for (int32 L = 0; L < NumLODLevels; L++)
+	{
+		const double S = ChunkSizeForLOD(L);
+		NewRing[L] = FIntVector(
+			FMath::FloorToInt32(PlayerPos.X / S) - CPS / 2,
+			FMath::FloorToInt32(PlayerPos.Y / S) - CPS / 2,
+			FMath::FloorToInt32(PlayerPos.Z / S) - CV / 2);
+	}
+
+	// ── 2. Per-slot coords, activation, base dirty set ─────────────────────
+	// DirtyMask: 0 = clean, 1 = re-mesh, 2 = became empty (zero its allocation)
+	TArray<uint8> DirtyMask;
+	DirtyMask.SetNumZeroed(MaxChunks);
+
+	for (int32 L = 0; L < NumLODLevels; L++)
+	{
+		const FIntVector O = NewRing[L];
+		for (int32 sz = 0; sz < CV; sz++)
+		for (int32 sy = 0; sy < CPS; sy++)
+		for (int32 sx = 0; sx < CPS; sx++)
+		{
+			const int32 Slot = L * ChunksPerLOD + (sz * CPS + sy) * CPS + sx;
+			const FIntVector Coord(
+				O.X + PosMod(sx - PosMod(O.X, CPS), CPS),
+				O.Y + PosMod(sy - PosMod(O.Y, CPS), CPS),
+				O.Z + PosMod(sz - PosMod(O.Z, CV), CV));
+
+			if (Coord != SlotCoord[Slot] || bForceAll)
+			{
+				const bool bActive = ChunkMayHaveSurface(Coord, L);
+				if (bActive)
+				{
+					DirtyMask[Slot] = 1;
+				}
+				else if (SlotActive[Slot] && !B.bInit)
+				{
+					DirtyMask[Slot] = 2;
+				}
+				SlotCoord[Slot] = Coord;
+				SlotActive[Slot] = bActive ? 1 : 0;
+			}
+		}
+	}
+
+	// ── 3. Carve-boundary changes: when the finer ring moves, coarse chunks
+	//       whose overlap with it changed must re-mesh ───────────────────────
+	if (!bForceAll)
+	{
+		for (int32 L = 1; L < NumLODLevels; L++)
+		{
+			if (NewRing[L - 1] == RingOrigin[L - 1])
+			{
+				continue;
+			}
+			const FBox OldFiner = FinerRingBox(RingOrigin[L - 1], L - 1);
+			const FBox NewFiner = FinerRingBox(NewRing[L - 1], L - 1);
+
+			for (int32 i = 0; i < ChunksPerLOD; i++)
+			{
+				const int32 Slot = L * ChunksPerLOD + i;
+				if (!SlotActive[Slot] || DirtyMask[Slot] != 0)
+				{
+					continue;
+				}
+				const FBox CB = ChunkBox(SlotCoord[Slot], L);
+				if (!CB.Overlap(OldFiner).Equals(CB.Overlap(NewFiner), 1.0))
+				{
+					DirtyMask[Slot] = 1;
+				}
+			}
+		}
+	}
+
+	// ── 4. Freshly applied edits: activate + dirty every chunk they touch ──
+	if (NumPendingEdits > 0 && !bForceAll)
+	{
+		for (int32 e = Edits.Num() - NumPendingEdits; e < Edits.Num(); e++)
+		{
+			const FVector4f& E = Edits[e];
+			const double R = FMath::Abs(double(E.W));
+
+			for (int32 L = 0; L < NumLODLevels; L++)
+			{
+				const double S = ChunkSizeForLOD(L);
+				const double Margin = 4.0 * S / double(CellsN);
+				const FIntVector MinC(
+					FMath::FloorToInt32((E.X - R - Margin) / S),
+					FMath::FloorToInt32((E.Y - R - Margin) / S),
+					FMath::FloorToInt32((E.Z - R - Margin) / S));
+				const FIntVector MaxC(
+					FMath::FloorToInt32((E.X + R + Margin) / S),
+					FMath::FloorToInt32((E.Y + R + Margin) / S),
+					FMath::FloorToInt32((E.Z + R + Margin) / S));
+
+				const FIntVector Lo(
+					FMath::Max(MinC.X, NewRing[L].X), FMath::Max(MinC.Y, NewRing[L].Y), FMath::Max(MinC.Z, NewRing[L].Z));
+				const FIntVector Hi(
+					FMath::Min(MaxC.X, NewRing[L].X + CPS - 1), FMath::Min(MaxC.Y, NewRing[L].Y + CPS - 1),
+					FMath::Min(MaxC.Z, NewRing[L].Z + CV - 1));
+
+				for (int32 cz = Lo.Z; cz <= Hi.Z; cz++)
+				for (int32 cy = Lo.Y; cy <= Hi.Y; cy++)
+				for (int32 cx = Lo.X; cx <= Hi.X; cx++)
+				{
+					const int32 Slot = L * ChunksPerLOD +
+						(PosMod(cz, CV) * CPS + PosMod(cy, CPS)) * CPS + PosMod(cx, CPS);
+					if (SlotCoord[Slot] == FIntVector(cx, cy, cz))
+					{
+						SlotActive[Slot] = 1;
+						DirtyMask[Slot] = 1;
+					}
+				}
+			}
+		}
+	}
+	NumPendingEdits = 0;
+	RingOrigin = NewRing;
+
+	// ── 5. Compose the GPU payload ──────────────────────────────────────────
+	B.Capacity = CurrentCapacity;
+	B.MaxChunks = uint32(MaxChunks);
+	B.CellsPerAxis = uint32(CellsN);
+	B.GroupsPerAxis = uint32(CellsN / 8);
+	B.MaxVertsPerChunkClamp = MaxVertsPerChunkClamp;
+	B.WorldUVScale = WorldUVScale;
+	B.ZBandMin = float(ZBandMin);
+	B.ZBandMax = float(ZBandMax);
+	B.CaveFreq = CaveNoiseFrequency;
+	B.CaveAmp = CaveNoiseAmplitude;
+	B.NumNoiseLayers = uint32(FMath::Min(NoiseLayers.Num(), 8));
+	for (uint32 i = 0; i < B.NumNoiseLayers; i++)
+	{
+		B.Noise[i] = FVector4f(NoiseLayers[i].Frequency, NoiseLayers[i].Amplitude,
+			NoiseLayers[i].OffsetX, NoiseLayers[i].OffsetY);
+	}
+
+	B.FinerMin.SetNum(NumLODLevels);
+	B.FinerMax.SetNum(NumLODLevels);
+	for (int32 L = 0; L < NumLODLevels; L++)
+	{
+		if (L == 0)
+		{
+			B.FinerMin[L] = FVector4f(1e30f, 1e30f, 1e30f, 0);
+			B.FinerMax[L] = FVector4f(-1e30f, -1e30f, -1e30f, 0);
+		}
+		else
+		{
+			const FBox F = FinerRingBox(NewRing[L - 1], L - 1);
+			B.FinerMin[L] = FVector4f(float(F.Min.X), float(F.Min.Y), float(F.Min.Z), 0);
+			B.FinerMax[L] = FVector4f(float(F.Max.X), float(F.Max.Y), float(F.Max.Z), 0);
+		}
+	}
+
+	B.EditData = Edits;
+	for (int32 Slot = 0; Slot < MaxChunks; Slot++)
+	{
+		if (DirtyMask[Slot] == 0)
+		{
+			continue;
+		}
+
+		const int32 L = Slot / ChunksPerLOD;
+		const double S = ChunkSizeForLOD(L);
+		const double Cell = S / double(CellsN);
+		const FIntVector Coord = SlotCoord[Slot];
+
+		uint32 Flags = uint32(L) << 8;
+		uint32 EditStart = uint32(B.EditIdx.Num());
+		uint32 EditCount = 0;
+
+		if (DirtyMask[Slot] == 2)
+		{
+			Flags |= FlagEmpty;
+		}
+		else
+		{
+			const FBox Box = ChunkBox(Coord, L).ExpandBy(4.0 * Cell);
+			for (int32 j = 0; j < Edits.Num(); j++)
+			{
+				const double R = FMath::Abs(double(Edits[j].W));
+				const FVector C(Edits[j].X, Edits[j].Y, Edits[j].Z);
+				if (Box.Intersect(FBox(C - FVector(R), C + FVector(R))))
+				{
+					B.EditIdx.Add(uint32(j));
+					EditCount++;
+				}
+			}
+		}
+
+		B.DirtyA.Add(FVector4f(float(Coord.X * S), float(Coord.Y * S), float(Coord.Z * S), float(Cell)));
+		B.DirtyB.Add(FUintVector4(uint32(Slot), EditStart, EditCount, Flags));
+	}
+
+	if (B.bCompact)
+	{
+		B.SlotToDirty.Init(0xFFFFFFFFu, MaxChunks);
+		for (int32 i = 0; i < B.DirtyB.Num(); i++)
+		{
+			B.SlotToDirty[B.DirtyB[i].X] = uint32(i);
+		}
+	}
+
+	// Active slot list for the proxy's draw loop.
+	TArray<uint32> Active;
+	for (int32 Slot = 0; Slot < MaxChunks; Slot++)
+	{
+		if (SlotActive[Slot])
+		{
+			Active.Add(uint32(Slot));
+		}
+	}
+	B.bActiveChanged = (Active != CachedActiveSlots) || B.bInit;
+	CachedActiveSlots = Active;
+	B.ActiveSlots = MoveTemp(Active);
+
+	// ── 6. Collision request (LOD 0 region around the player) ──────────────
+	{
+		const double S0 = ChunkSizeForLOD(0);
+		const FIntVector Center(
+			FMath::FloorToInt32(PlayerPos.X / S0),
+			FMath::FloorToInt32(PlayerPos.Y / S0),
+			FMath::FloorToInt32(PlayerPos.Z / S0));
+
+		bool bAnyLOD0Dirty = false;
+		for (int32 i = 0; i < ChunksPerLOD && !bAnyLOD0Dirty; i++)
+		{
+			bAnyLOD0Dirty = DirtyMask[i] != 0;
+		}
+		if (bAnyLOD0Dirty || Center != LastCollCenter)
+		{
+			bCollRegionDirty = true;
+		}
+
+		if (bCollRegionDirty && !bCollPending && !bCollisionCookInProgress)
+		{
+			for (int32 i = 0; i < ChunksPerLOD; i++)
+			{
+				if (!SlotActive[i])
+				{
+					continue;
+				}
+				const FIntVector D = SlotCoord[i] - Center;
+				if (FMath::Max3(FMath::Abs(D.X), FMath::Abs(D.Y), FMath::Abs(D.Z)) <= CollisionRadiusChunks)
+				{
+					B.CollSlots.Add(uint32(i));
+				}
+			}
+
+			if (B.CollSlots.Num() > 0)
+			{
+				if (!CollMetaReadback)
+				{
+					CollMetaReadback = new FRHIGPUBufferReadback(TEXT("OctreeCollMetaReadback"));
+					CollPosReadback = new FRHIGPUBufferReadback(TEXT("OctreeCollPosReadback"));
+				}
+				B.bCollision = true;
+				bCollPending = true;
+				bCollArmed.store(false, std::memory_order_release);
+				bCollRegionDirty = false;
+				LastCollCenter = Center;
+				LastCollSlotCount = uint32(B.CollSlots.Num());
+			}
+		}
+	}
+
+	// ── 7. AllocState readback (one in flight) ─────────────────────────────
+	if (!bStatePending)
+	{
+		if (!StateReadback)
+		{
+			StateReadback = new FRHIGPUBufferReadback(TEXT("OctreeAllocStateReadback"));
+		}
+		B.bStateReadback = true;
+		bStatePending = true;
+		bStateArmed.store(false, std::memory_order_release);
+	}
+
+	const bool bAnyWork = B.bInit || B.bCompact || B.bCollision || B.bActiveChanged || B.DirtyB.Num() > 0;
+	if (!bAnyWork)
+	{
+		if (B.bStateReadback)
+		{
+			bStatePending = false;
+		}
+		return;
+	}
+
+	bGPUInitialized = true;
+
+	// ── 8. Render-thread update graph ───────────────────────────────────────
+	ENQUEUE_RENDER_COMMAND(OctreeTerrainUpdate)(
+		[this, B = MoveTemp(B)](FRHICommandListImmediate& RHICmdList) mutable
+		{
+			FRDGBuilder GraphBuilder(RHICmdList);
+
+			const uint32 DirtyCount = uint32(B.DirtyB.Num());
+			const bool bSwapPools = B.bInit || B.bCompact;
+
+			// --- pool buffers (old + target) ---------------------------------
+			FRDGBufferRef OldPosBuf = nullptr, OldTanBuf = nullptr, OldUVBuf = nullptr, OldColBuf = nullptr;
+			if (!B.bInit)
+			{
+				OldPosBuf = GraphBuilder.RegisterExternalBuffer(PoolPos);
+				OldTanBuf = GraphBuilder.RegisterExternalBuffer(PoolTan);
+				OldUVBuf = GraphBuilder.RegisterExternalBuffer(PoolUV);
+				OldColBuf = GraphBuilder.RegisterExternalBuffer(PoolColor);
+			}
+
+			FRDGBufferRef PosBuf, TanBuf, UVBuf, ColBuf;
+			if (bSwapPools)
+			{
+				FRDGBufferDesc PosDesc = FRDGBufferDesc::CreateBufferDesc(16, B.Capacity);
+				PosDesc.Usage |= BUF_VertexBuffer | BUF_ShaderResource | BUF_UnorderedAccess;
+				PosBuf = GraphBuilder.CreateBuffer(PosDesc, TEXT("OctreePosPool"));
+
+				FRDGBufferDesc TanDesc = FRDGBufferDesc::CreateBufferDesc(16, B.Capacity * 2);
+				TanDesc.Usage |= BUF_VertexBuffer | BUF_ShaderResource | BUF_UnorderedAccess;
+				TanBuf = GraphBuilder.CreateBuffer(TanDesc, TEXT("OctreeTanPool"));
+
+				FRDGBufferDesc UVDesc = FRDGBufferDesc::CreateBufferDesc(8, B.Capacity);
+				UVDesc.Usage |= BUF_VertexBuffer | BUF_ShaderResource | BUF_UnorderedAccess;
+				UVBuf = GraphBuilder.CreateBuffer(UVDesc, TEXT("OctreeUVPool"));
+
+				FRDGBufferDesc ColDesc = FRDGBufferDesc::CreateBufferDesc(4, B.Capacity);
+				ColDesc.Usage |= BUF_VertexBuffer | BUF_ShaderResource | BUF_UnorderedAccess;
+				ColBuf = GraphBuilder.CreateBuffer(ColDesc, TEXT("OctreeColPool"));
+			}
+			else
+			{
+				PosBuf = OldPosBuf;
+				TanBuf = OldTanBuf;
+				UVBuf = OldUVBuf;
+				ColBuf = OldColBuf;
+			}
+
+			// --- control buffers ---------------------------------------------
+			FRDGBufferRef ArgsBuf, AllocBuf, StateBuf, IdentBuf;
+			if (B.bInit)
+			{
+				FRDGBufferDesc ArgsDesc = FRDGBufferDesc::CreateBufferDesc(4, B.MaxChunks * 8);
+				ArgsDesc.Usage |= BUF_DrawIndirect | BUF_UnorderedAccess | BUF_ShaderResource;
+				ArgsBuf = GraphBuilder.CreateBuffer(ArgsDesc, TEXT("OctreeDrawArgs"));
+
+				AllocBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(16, B.MaxChunks), TEXT("OctreeChunkAlloc"));
+
+				FRDGBufferDesc StateDesc = FRDGBufferDesc::CreateBufferDesc(4, 8);
+				StateDesc.Usage |= BUF_SourceCopy;
+				StateBuf = GraphBuilder.CreateBuffer(StateDesc, TEXT("OctreeAllocState"));
+
+				FRDGBufferDesc IdentDesc = FRDGBufferDesc::CreateBufferDesc(4, B.MaxVertsPerChunkClamp);
+				IdentDesc.Usage |= BUF_IndexBuffer | BUF_UnorderedAccess | BUF_ShaderResource;
+				IdentBuf = GraphBuilder.CreateBuffer(IdentDesc, TEXT("OctreeIdentityIB"));
+			}
+			else
+			{
+				ArgsBuf = GraphBuilder.RegisterExternalBuffer(PoolArgs);
+				AllocBuf = GraphBuilder.RegisterExternalBuffer(PoolAlloc);
+				StateBuf = GraphBuilder.RegisterExternalBuffer(PoolState);
+				IdentBuf = GraphBuilder.RegisterExternalBuffer(PoolIdentity);
+			}
+
+			// --- transient uploads --------------------------------------------
+			auto Upload = [&GraphBuilder](const TCHAR* Name, uint32 Stride, const void* Data, uint32 Count)
+			{
+				FRDGBufferRef Buf = GraphBuilder.CreateBuffer(
+					FRDGBufferDesc::CreateBufferDesc(Stride, FMath::Max(Count, 1u)), Name);
+				if (Count > 0)
+				{
+					GraphBuilder.QueueBufferUpload(Buf, Data, uint64(Stride) * Count);
+				}
+				return Buf;
+			};
+
+			FRDGBufferRef DirtyABuf = Upload(TEXT("OctreeDirtyA"), 16, B.DirtyA.GetData(), DirtyCount);
+			FRDGBufferRef DirtyBBuf = Upload(TEXT("OctreeDirtyB"), 16, B.DirtyB.GetData(), DirtyCount);
+			FRDGBufferRef EditBuf = Upload(TEXT("OctreeEdits"), 16, B.EditData.GetData(), uint32(B.EditData.Num()));
+			FRDGBufferRef EditIdxBuf = Upload(TEXT("OctreeEditIdx"), 4, B.EditIdx.GetData(), uint32(B.EditIdx.Num()));
+
+			FRDGBufferRef CountsBuf = GraphBuilder.CreateBuffer(
+				FRDGBufferDesc::CreateBufferDesc(4, FMath::Max(DirtyCount, 1u)), TEXT("OctreeCounts"));
+			FRDGBufferRef CursorsBuf = GraphBuilder.CreateBuffer(
+				FRDGBufferDesc::CreateBufferDesc(4, FMath::Max(DirtyCount, 1u)), TEXT("OctreeCursors"));
+			FRDGBufferRef MeshSkipBuf = GraphBuilder.CreateBuffer(
+				FRDGBufferDesc::CreateBufferDesc(4, FMath::Max(DirtyCount, 1u)), TEXT("OctreeMeshSkip"));
+
+			FRDGBufferRef SlotToDirtyBuf = nullptr;
+			FRDGBufferRef OldOffsetsBuf = nullptr;
+			if (B.bCompact)
+			{
+				SlotToDirtyBuf = Upload(TEXT("OctreeSlotToDirty"), 4, B.SlotToDirty.GetData(), B.MaxChunks);
+				OldOffsetsBuf = GraphBuilder.CreateBuffer(
+					FRDGBufferDesc::CreateBufferDesc(4, B.MaxChunks), TEXT("OctreeOldOffsets"));
+			}
+
+			auto FillSDF = [&](FOctreeSDFParams& S)
+			{
+				S.NumNoiseLayers = B.NumNoiseLayers;
+				for (int32 i = 0; i < 8; i++)
+				{
+					S.NoiseLayers[i] = (i < int32(B.NumNoiseLayers)) ? B.Noise[i] : FVector4f(0, 0, 0, 0);
+				}
+				S.CaveNoiseFrequency = B.CaveFreq;
+				S.CaveNoiseAmplitude = B.CaveAmp;
+				S.EditSpheres = GraphBuilder.CreateSRV(EditBuf, PF_A32B32G32R32F);
+				S.EditIndexList = GraphBuilder.CreateSRV(EditIdxBuf, PF_R32_UINT);
+			};
+
+			auto FillChunk = [&](FOctreeChunkParams& C)
+			{
+				C.DirtyInfoA = GraphBuilder.CreateSRV(DirtyABuf, PF_A32B32G32R32F);
+				C.DirtyInfoB = GraphBuilder.CreateSRV(DirtyBBuf, PF_R32G32B32A32_UINT);
+				C.DirtyCount = DirtyCount;
+				C.CellsPerAxis = B.CellsPerAxis;
+				C.GroupsPerAxis = B.GroupsPerAxis;
+				for (int32 i = 0; i < 10; i++)
+				{
+					C.FinerVolMin[i] = (i < B.FinerMin.Num()) ? B.FinerMin[i] : FVector4f(1e30f, 1e30f, 1e30f, 0);
+					C.FinerVolMax[i] = (i < B.FinerMax.Num()) ? B.FinerMax[i] : FVector4f(-1e30f, -1e30f, -1e30f, 0);
+				}
+			};
+
+			const auto ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
+
+			// --- PASS: one-time init ------------------------------------------
+			if (B.bInit)
+			{
+				TShaderMapRef<FOctreeInitPoolCS> CS(ShaderMap);
+				auto* P = GraphBuilder.AllocParameters<FOctreeInitPoolCS::FParameters>();
+				P->IdentityIndices = GraphBuilder.CreateUAV(IdentBuf, PF_R32_UINT);
+				P->ChunkAlloc = GraphBuilder.CreateUAV(AllocBuf, PF_R32G32B32A32_UINT);
+				P->DrawArgs = GraphBuilder.CreateUAV(ArgsBuf, PF_R32_UINT);
+				P->AllocState = GraphBuilder.CreateUAV(StateBuf, PF_R32_UINT);
+				P->IdentityCount = B.MaxVertsPerChunkClamp;
+				P->MaxChunks = B.MaxChunks;
+				const uint32 MaxItems = FMath::Max(B.MaxVertsPerChunkClamp, B.MaxChunks);
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("OctreeInitPool"), CS, P,
+					FIntVector(FMath::DivideAndRoundUp(MaxItems, 64u), 1, 1));
+			}
+
+			// --- PASS: count --------------------------------------------------
+			if (DirtyCount > 0)
+			{
+				AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(CountsBuf, PF_R32_UINT), 0u);
+				AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(CursorsBuf, PF_R32_UINT), 0u);
+
+				TShaderMapRef<FOctreeCountCS> CS(ShaderMap);
+				auto* P = GraphBuilder.AllocParameters<FOctreeCountCS::FParameters>();
+				FillSDF(P->SDF);
+				FillChunk(P->Chunk);
+				P->Counts = GraphBuilder.CreateUAV(CountsBuf, PF_R32_UINT);
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("OctreeCount"), CS, P,
+					FIntVector(B.GroupsPerAxis, B.GroupsPerAxis, B.GroupsPerAxis * DirtyCount));
+			}
+
+			// --- PASS: allocation ---------------------------------------------
+			if (B.bCompact)
+			{
+				TShaderMapRef<FOctreeCompactAllocCS> CS(ShaderMap);
+				auto* P = GraphBuilder.AllocParameters<FOctreeCompactAllocCS::FParameters>();
+				P->DirtyInfoB = GraphBuilder.CreateSRV(DirtyBBuf, PF_R32G32B32A32_UINT);
+				P->CountsRO = GraphBuilder.CreateSRV(CountsBuf, PF_R32_UINT);
+				P->SlotToDirty = GraphBuilder.CreateSRV(SlotToDirtyBuf, PF_R32_UINT);
+				P->ChunkAlloc = GraphBuilder.CreateUAV(AllocBuf, PF_R32G32B32A32_UINT);
+				P->DrawArgs = GraphBuilder.CreateUAV(ArgsBuf, PF_R32_UINT);
+				P->AllocState = GraphBuilder.CreateUAV(StateBuf, PF_R32_UINT);
+				P->MeshSkip = GraphBuilder.CreateUAV(MeshSkipBuf, PF_R32_UINT);
+				P->OldOffsets = GraphBuilder.CreateUAV(OldOffsetsBuf, PF_R32_UINT);
+				P->MaxChunks = B.MaxChunks;
+				P->CapacityVerts = B.Capacity;
+				P->MaxVertsPerChunkClamp = B.MaxVertsPerChunkClamp;
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("OctreeCompactAlloc"), CS, P, FIntVector(1, 1, 1));
+
+				// Copy surviving clean chunks into the new pool.
+				TShaderMapRef<FOctreeCopyChunksCS> CopyCS(ShaderMap);
+				auto* CP = GraphBuilder.AllocParameters<FOctreeCopyChunksCS::FParameters>();
+				CP->SlotToDirty = GraphBuilder.CreateSRV(SlotToDirtyBuf, PF_R32_UINT);
+				CP->OldOffsetsRO = GraphBuilder.CreateSRV(OldOffsetsBuf, PF_R32_UINT);
+				CP->ChunkAllocRO = GraphBuilder.CreateSRV(AllocBuf, PF_R32G32B32A32_UINT);
+				CP->SrcPositions = GraphBuilder.CreateSRV(OldPosBuf, PF_A32B32G32R32F);
+				CP->SrcTangents = GraphBuilder.CreateSRV(OldTanBuf, PF_A32B32G32R32F);
+				CP->SrcUVs = GraphBuilder.CreateSRV(OldUVBuf, PF_G32R32F);
+				CP->SrcColors = GraphBuilder.CreateSRV(OldColBuf, PF_R32_UINT);
+				CP->OutPositions = GraphBuilder.CreateUAV(PosBuf, PF_A32B32G32R32F);
+				CP->OutTangents = GraphBuilder.CreateUAV(TanBuf, PF_A32B32G32R32F);
+				CP->OutUVs = GraphBuilder.CreateUAV(UVBuf, PF_G32R32F);
+				CP->OutColors = GraphBuilder.CreateUAV(ColBuf, PF_R32_UINT);
+				CP->MaxChunks = B.MaxChunks;
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("OctreeCopyChunks"), CopyCS, CP,
+					FIntVector(B.MaxChunks, 1, 1));
+			}
+			else if (DirtyCount > 0)
+			{
+				TShaderMapRef<FOctreeAllocCS> CS(ShaderMap);
+				auto* P = GraphBuilder.AllocParameters<FOctreeAllocCS::FParameters>();
+				P->DirtyInfoB = GraphBuilder.CreateSRV(DirtyBBuf, PF_R32G32B32A32_UINT);
+				P->CountsRO = GraphBuilder.CreateSRV(CountsBuf, PF_R32_UINT);
+				P->ChunkAlloc = GraphBuilder.CreateUAV(AllocBuf, PF_R32G32B32A32_UINT);
+				P->DrawArgs = GraphBuilder.CreateUAV(ArgsBuf, PF_R32_UINT);
+				P->AllocState = GraphBuilder.CreateUAV(StateBuf, PF_R32_UINT);
+				P->MeshSkip = GraphBuilder.CreateUAV(MeshSkipBuf, PF_R32_UINT);
+				P->DirtyCount = DirtyCount;
+				P->CapacityVerts = B.Capacity;
+				P->MaxVertsPerChunkClamp = B.MaxVertsPerChunkClamp;
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("OctreeAlloc"), CS, P, FIntVector(1, 1, 1));
+			}
+
+			// --- PASS: mesh -----------------------------------------------------
+			if (DirtyCount > 0)
+			{
+				TShaderMapRef<FOctreeMeshCS> CS(ShaderMap);
+				auto* P = GraphBuilder.AllocParameters<FOctreeMeshCS::FParameters>();
+				FillSDF(P->SDF);
+				FillChunk(P->Chunk);
+				P->ChunkAllocRO = GraphBuilder.CreateSRV(AllocBuf, PF_R32G32B32A32_UINT);
+				P->MeshSkipRO = GraphBuilder.CreateSRV(MeshSkipBuf, PF_R32_UINT);
+				P->Cursors = GraphBuilder.CreateUAV(CursorsBuf, PF_R32_UINT);
+				P->OutPositions = GraphBuilder.CreateUAV(PosBuf, PF_A32B32G32R32F);
+				P->OutTangents = GraphBuilder.CreateUAV(TanBuf, PF_A32B32G32R32F);
+				P->OutUVs = GraphBuilder.CreateUAV(UVBuf, PF_G32R32F);
+				P->OutColors = GraphBuilder.CreateUAV(ColBuf, PF_R32_UINT);
+				P->WorldUVScale = B.WorldUVScale;
+				P->ZBandMin = B.ZBandMin;
+				P->ZBandMax = B.ZBandMax;
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("OctreeMesh"), CS, P,
+					FIntVector(B.GroupsPerAxis, B.GroupsPerAxis, B.GroupsPerAxis * DirtyCount));
+			}
+
+			// --- PASS: collision gather ----------------------------------------
+			TRefCountPtr<FRDGPooledBuffer> CollMetaPooled, CollPosPooled;
+			const uint32 CollCount = uint32(B.CollSlots.Num());
+			if (B.bCollision && CollCount > 0)
+			{
+				FRDGBufferRef CollSlotsBuf = Upload(TEXT("OctreeCollSlots"), 4, B.CollSlots.GetData(), CollCount);
+
+				FRDGBufferDesc MetaDesc = FRDGBufferDesc::CreateBufferDesc(4, 2 * CollCount + 1);
+				MetaDesc.Usage |= BUF_SourceCopy;
+				FRDGBufferRef CollMetaBuf = GraphBuilder.CreateBuffer(MetaDesc, TEXT("OctreeCollMeta"));
+
+				FRDGBufferDesc PosOutDesc = FRDGBufferDesc::CreateBufferDesc(16, OctreeTerrain::CollMaxVerts);
+				PosOutDesc.Usage |= BUF_SourceCopy;
+				FRDGBufferRef CollPosBuf = GraphBuilder.CreateBuffer(PosOutDesc, TEXT("OctreeCollPos"));
+
+				{
+					TShaderMapRef<FOctreeCollisionPrefixCS> CS(ShaderMap);
+					auto* P = GraphBuilder.AllocParameters<FOctreeCollisionPrefixCS::FParameters>();
+					P->CollSlots = GraphBuilder.CreateSRV(CollSlotsBuf, PF_R32_UINT);
+					P->ChunkAllocRO = GraphBuilder.CreateSRV(AllocBuf, PF_R32G32B32A32_UINT);
+					P->CollMeta = GraphBuilder.CreateUAV(CollMetaBuf, PF_R32_UINT);
+					P->CollCount = CollCount;
+					P->CollMaxVerts = OctreeTerrain::CollMaxVerts;
+					FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("OctreeCollPrefix"), CS, P, FIntVector(1, 1, 1));
+				}
+				{
+					TShaderMapRef<FOctreeCollisionCopyCS> CS(ShaderMap);
+					auto* P = GraphBuilder.AllocParameters<FOctreeCollisionCopyCS::FParameters>();
+					P->CollSlots = GraphBuilder.CreateSRV(CollSlotsBuf, PF_R32_UINT);
+					P->ChunkAllocRO = GraphBuilder.CreateSRV(AllocBuf, PF_R32G32B32A32_UINT);
+					P->CollMetaRO = GraphBuilder.CreateSRV(CollMetaBuf, PF_R32_UINT);
+					P->SrcPositions = GraphBuilder.CreateSRV(PosBuf, PF_A32B32G32R32F);
+					P->CollOutPos = GraphBuilder.CreateUAV(CollPosBuf, PF_A32B32G32R32F);
+					P->CollCount = CollCount;
+					FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("OctreeCollCopy"), CS, P,
+						FIntVector(CollCount, 1, 1));
+				}
+
+				GraphBuilder.QueueBufferExtraction(CollMetaBuf, &CollMetaPooled, ERHIAccess::CopySrc);
+				GraphBuilder.QueueBufferExtraction(CollPosBuf, &CollPosPooled, ERHIAccess::CopySrc);
+			}
+
+			// --- extraction ------------------------------------------------------
+			if (bSwapPools)
+			{
+				GraphBuilder.QueueBufferExtraction(PosBuf, &PoolPos, ERHIAccess::UAVCompute);
+				GraphBuilder.QueueBufferExtraction(TanBuf, &PoolTan, ERHIAccess::UAVCompute);
+				GraphBuilder.QueueBufferExtraction(UVBuf, &PoolUV, ERHIAccess::UAVCompute);
+				GraphBuilder.QueueBufferExtraction(ColBuf, &PoolColor, ERHIAccess::UAVCompute);
+			}
+			if (B.bInit)
+			{
+				GraphBuilder.QueueBufferExtraction(ArgsBuf, &PoolArgs, ERHIAccess::UAVCompute);
+				GraphBuilder.QueueBufferExtraction(AllocBuf, &PoolAlloc, ERHIAccess::UAVCompute);
+				GraphBuilder.QueueBufferExtraction(StateBuf, &PoolState, ERHIAccess::UAVCompute);
+				GraphBuilder.QueueBufferExtraction(IdentBuf, &PoolIdentity, ERHIAccess::UAVCompute);
+			}
+
+			GraphBuilder.Execute();
+
+			// --- proxy + readbacks ------------------------------------------------
+			if (FOctreeTerrainSceneProxy* Proxy = static_cast<FOctreeTerrainSceneProxy*>(SceneProxy))
+			{
+				if (bSwapPools)
+				{
+					Proxy->UpdateBuffers_RenderThread(PoolPos, PoolTan, PoolUV, PoolColor,
+						PoolIdentity, PoolArgs, B.Capacity, B.MaxChunks);
+				}
+				if (B.bActiveChanged)
+				{
+					Proxy->SetActiveSlots_RenderThread(B.ActiveSlots);
+				}
+			}
+
+			if (B.bStateReadback && StateReadback && PoolState.IsValid())
+			{
+				StateReadback->EnqueueCopy(RHICmdList, PoolState->GetRHI(), 16);
+				bStateArmed.store(true, std::memory_order_release);
+			}
+
+			if (B.bCollision && CollMetaPooled.IsValid() && CollPosPooled.IsValid())
+			{
+				CollMetaReadback->EnqueueCopy(RHICmdList, CollMetaPooled->GetRHI(), (2 * CollCount + 1) * sizeof(uint32));
+				CollPosReadback->EnqueueCopy(RHICmdList, CollPosPooled->GetRHI(), OctreeTerrain::CollMaxVerts * sizeof(FVector4f));
+				bCollArmed.store(true, std::memory_order_release);
+			}
+		});
+}
+
+// ============================================================================
+// Component: readbacks + collision cooking
+// ============================================================================
+
+void UOctreeTerrainComponent::PollReadbacks()
+{
+	// --- alloc state (pool occupancy, overflow) ---------------------------
+	if (bStatePending && bStateArmed.load(std::memory_order_acquire) && StateReadback && StateReadback->IsReady())
+	{
+		bStatePending = false;
+		bStateArmed.store(false, std::memory_order_release);
+
+		FRHIGPUBufferReadback* Readback = StateReadback;
+		TWeakObjectPtr<UOctreeTerrainComponent> WeakThis(this);
+		ENQUEUE_RENDER_COMMAND(OctreeReadAllocState)(
+			[Readback, WeakThis](FRHICommandListImmediate&)
+			{
+				const uint32* Data = static_cast<const uint32*>(Readback->Lock(16));
+				if (!Data)
+				{
+					return;
+				}
+				const uint32 Head = Data[0];
+				const uint32 Overflow = Data[1];
+				const uint32 Live = Data[2];
+				Readback->Unlock();
+
+				AsyncTask(ENamedThreads::GameThread, [WeakThis, Head, Overflow, Live]()
+				{
+					if (UOctreeTerrainComponent* Comp = WeakThis.Get())
+					{
+						Comp->HandleAllocState(Head, Overflow, Live);
+					}
+				});
+			});
+	}
+
+	// --- collision geometry -------------------------------------------------
+	if (bCollPending && bCollArmed.load(std::memory_order_acquire) &&
+		CollMetaReadback && CollPosReadback &&
+		CollMetaReadback->IsReady() && CollPosReadback->IsReady())
+	{
+		bCollPending = false;
+		bCollArmed.store(false, std::memory_order_release);
+
+		FRHIGPUBufferReadback* MetaRB = CollMetaReadback;
+		FRHIGPUBufferReadback* PosRB = CollPosReadback;
+		const uint32 SlotCount = LastCollSlotCount;
+		TWeakObjectPtr<UOctreeTerrainComponent> WeakThis(this);
+
+		ENQUEUE_RENDER_COMMAND(OctreeReadCollision)(
+			[MetaRB, PosRB, SlotCount, WeakThis](FRHICommandListImmediate&)
+			{
+				const uint32 MetaBytes = (2 * SlotCount + 1) * sizeof(uint32);
+				const uint32* Meta = static_cast<const uint32*>(MetaRB->Lock(MetaBytes));
+				if (!Meta)
+				{
+					return;
+				}
+				const uint32 Total = FMath::Min(Meta[2 * SlotCount], OctreeTerrain::CollMaxVerts);
+				MetaRB->Unlock();
+
+				TArray<FVector3f> NewVerts;
+				if (Total >= 3)
+				{
+					const FVector4f* Pos = static_cast<const FVector4f*>(PosRB->Lock(Total * sizeof(FVector4f)));
+					if (Pos)
+					{
+						const uint32 UsableTotal = Total - (Total % 3);
+						NewVerts.Reserve(UsableTotal);
+						for (uint32 i = 0; i < UsableTotal; i++)
+						{
+							NewVerts.Add(FVector3f(Pos[i].X, Pos[i].Y, Pos[i].Z));
+						}
+						PosRB->Unlock();
+					}
+				}
+
+				if (NewVerts.Num() < 3)
+				{
+					return;
+				}
+
+				TArray<FTriIndices> NewTris;
+				NewTris.Reserve(NewVerts.Num() / 3);
+				for (int32 i = 0; i + 2 < NewVerts.Num(); i += 3)
+				{
+					FTriIndices T;
+					T.v0 = i;
+					T.v1 = i + 1;
+					T.v2 = i + 2;
+					NewTris.Add(T);
+				}
+
+				AsyncTask(ENamedThreads::GameThread,
+					[WeakThis, Verts = MoveTemp(NewVerts), Tris = MoveTemp(NewTris)]() mutable
+					{
+						if (UOctreeTerrainComponent* Comp = WeakThis.Get())
+						{
+							Comp->CollisionVertices = MoveTemp(Verts);
+							Comp->CollisionTriIndices = MoveTemp(Tris);
+							Comp->RebuildCollision();
+						}
+					});
+			});
+	}
 }
 
 void UOctreeTerrainComponent::RebuildCollision()
 {
-	if (CollisionVertices.IsEmpty()
-		|| CollisionTriangles.IsEmpty()
-		|| bCollisionCookInProgress)
+	if (CollisionVertices.Num() == 0 || CollisionTriIndices.Num() == 0 || bCollisionCookInProgress)
 	{
 		return;
 	}
@@ -576,21 +1573,42 @@ void UOctreeTerrainComponent::RebuildCollision()
 
 	TWeakObjectPtr<UOctreeTerrainComponent> WeakThis(this);
 	CollisionBodySetup->CreatePhysicsMeshesAsync(
-		FOnAsyncPhysicsCookFinished::CreateLambda(
-			[WeakThis](bool bSuccess)
+		FOnAsyncPhysicsCookFinished::CreateLambda([WeakThis](bool bSuccess)
+		{
+			AsyncTask(ENamedThreads::GameThread, [WeakThis, bSuccess]()
 			{
-				AsyncTask(
-					ENamedThreads::GameThread,
-					[WeakThis, bSuccess]()
+				if (UOctreeTerrainComponent* Comp = WeakThis.Get())
+				{
+					Comp->bCollisionCookInProgress = false;
+					if (bSuccess)
 					{
-						if (UOctreeTerrainComponent* Component = WeakThis.Get())
-						{
-							Component->bCollisionCookInProgress = false;
-							if (bSuccess)
-							{
-								Component->RecreatePhysicsState();
-							}
-						}
-					});
-			}));
+						Comp->RecreatePhysicsState();
+					}
+				}
+			});
+		}));
+}
+
+UBodySetup* UOctreeTerrainComponent::GetBodySetup()
+{
+	return CollisionBodySetup;
+}
+
+bool UOctreeTerrainComponent::GetPhysicsTriMeshData(FTriMeshCollisionData* CollisionData, bool InUseAllTriData)
+{
+	if (CollisionVertices.Num() == 0 || CollisionTriIndices.Num() == 0)
+	{
+		return false;
+	}
+
+	CollisionData->Vertices = CollisionVertices;
+	CollisionData->Indices = CollisionTriIndices;
+	CollisionData->MaterialIndices.SetNumZeroed(CollisionTriIndices.Num());
+	CollisionData->bFastCook = true;
+	return true;
+}
+
+bool UOctreeTerrainComponent::ContainsPhysicsTriMeshData(bool InUseAllTriData) const
+{
+	return CollisionVertices.Num() > 0 && CollisionTriIndices.Num() > 0;
 }

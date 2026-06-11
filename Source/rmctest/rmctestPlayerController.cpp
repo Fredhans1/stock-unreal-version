@@ -1,11 +1,13 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
-
 #include "rmctestPlayerController.h"
-#include "EnhancedInputSubsystems.h"
-#include "Engine/LocalPlayer.h"
-#include "InputMappingContext.h"
+
 #include "Blueprint/UserWidget.h"
+#include "Engine/LocalPlayer.h"
+#include "Engine/World.h"
+#include "EnhancedInputSubsystems.h"
+#include "FlyCameraPawn.h"
+#include "InputMappingContext.h"
 #include "rmctest.h"
 #include "Widgets/Input/SVirtualJoystick.h"
 
@@ -13,26 +15,21 @@ void ArmctestPlayerController::BeginPlay()
 {
 	Super::BeginPlay();
 
-	// Capture the default character pawn
-	SpawnedCharacter = Cast<ACharacter>(GetPawn());
-
-	// only spawn touch controls on local player controllers
-	if (ShouldUseTouchControls() && IsLocalPlayerController())
+	if (ShouldUseTouchControls()
+		&& IsLocalPlayerController()
+		&& MobileControlsWidgetClass)
 	{
-		// spawn the mobile controls widget
-		MobileControlsWidget = CreateWidget<UUserWidget>(this, MobileControlsWidgetClass);
+		MobileControlsWidget =
+			CreateWidget<UUserWidget>(this, MobileControlsWidgetClass);
 
 		if (MobileControlsWidget)
 		{
-			// add the controls to the player screen
 			MobileControlsWidget->AddToPlayerScreen(0);
-
-		} else {
-
-			UE_LOG(Logrmctest, Error, TEXT("Could not spawn mobile controls widget."));
-
 		}
-
+		else
+		{
+			UE_LOG(Logrmctest, Error, TEXT("Could not spawn mobile controls widget."));
+		}
 	}
 }
 
@@ -40,70 +37,96 @@ void ArmctestPlayerController::SetupInputComponent()
 {
 	Super::SetupInputComponent();
 
-	InputComponent->BindKey(EKeys::F, IE_Pressed, this, &ArmctestPlayerController::TogglePawn);
+	InputComponent->BindKey(
+		EKeys::F,
+		IE_Pressed,
+		this,
+		&ArmctestPlayerController::ToggleFlyPawn);
 
-	// only add IMCs for local player controllers
-	if (IsLocalPlayerController())
+	if (!IsLocalPlayerController())
 	{
-		// Add Input Mapping Contexts
-		if (UEnhancedInputLocalPlayerSubsystem* Subsystem = ULocalPlayer::GetSubsystem<UEnhancedInputLocalPlayerSubsystem>(GetLocalPlayer()))
-		{
-			for (UInputMappingContext* CurrentContext : DefaultMappingContexts)
-			{
-				Subsystem->AddMappingContext(CurrentContext, 0);
-			}
+		return;
+	}
 
-			// only add these IMCs if we're not using mobile touch input
-			if (!ShouldUseTouchControls())
+	if (UEnhancedInputLocalPlayerSubsystem* Subsystem =
+		ULocalPlayer::GetSubsystem<UEnhancedInputLocalPlayerSubsystem>(
+			GetLocalPlayer()))
+	{
+		for (UInputMappingContext* Context : DefaultMappingContexts)
+		{
+			if (Context)
 			{
-				for (UInputMappingContext* CurrentContext : MobileExcludedMappingContexts)
+				Subsystem->AddMappingContext(Context, 0);
+			}
+		}
+
+		if (!ShouldUseTouchControls())
+		{
+			for (UInputMappingContext* Context : MobileExcludedMappingContexts)
+			{
+				if (Context)
 				{
-					Subsystem->AddMappingContext(CurrentContext, 0);
+					Subsystem->AddMappingContext(Context, 0);
 				}
 			}
 		}
 	}
 }
 
-void ArmctestPlayerController::TogglePawn()
+void ArmctestPlayerController::ToggleFlyPawn()
 {
-	if (!bInFlyCam)
+	if (!GetWorld())
 	{
-		// Currently in character — switch to fly cam
-		SpawnedCharacter = Cast<ACharacter>(GetPawn()); // keep ref up to date
+		return;
+	}
 
-		FVector SpawnLoc = SpawnedCharacter ? SpawnedCharacter->GetActorLocation() + FVector(0, 0, 100) : FVector::ZeroVector;
-
-		if (!FlyCamPawn || !IsValid(FlyCamPawn))
+	if (Cast<AFlyCameraPawn>(GetPawn()))
+	{
+		if (IsValid(PreviousPawn))
 		{
-			FActorSpawnParameters Params;
-			Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-			FlyCamPawn = GetWorld()->SpawnActor<AFlyCameraPawn>(AFlyCameraPawn::StaticClass(), SpawnLoc, GetControlRotation(), Params);
+			Possess(PreviousPawn);
 		}
+		return;
+	}
 
-		if (FlyCamPawn && IsValid(FlyCamPawn))
-		{
-			UnPossess();
-			Possess(FlyCamPawn);
-			bInFlyCam = true;
-		}
+	PreviousPawn = GetPawn();
+
+	FVector CameraLocation;
+	FRotator CameraRotation;
+	GetPlayerViewPoint(CameraLocation, CameraRotation);
+
+	if (!IsValid(FlyCamPawn))
+	{
+		FActorSpawnParameters SpawnParameters;
+		SpawnParameters.Owner = this;
+		SpawnParameters.SpawnCollisionHandlingOverride =
+			ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+		FlyCamPawn = GetWorld()->SpawnActor<AFlyCameraPawn>(
+			AFlyCameraPawn::StaticClass(),
+			CameraLocation,
+			CameraRotation,
+			SpawnParameters);
 	}
 	else
 	{
-		// Currently in fly cam — switch back to character
-		if (SpawnedCharacter && IsValid(SpawnedCharacter))
-		{
-			FVector CamLoc = FlyCamPawn ? FlyCamPawn->GetActorLocation() : SpawnedCharacter->GetActorLocation();
-			SpawnedCharacter->SetActorLocation(CamLoc, false, nullptr, ETeleportType::TeleportPhysics);
-			UnPossess();
-			Possess(SpawnedCharacter);
-			bInFlyCam = false;
-		}
+		FlyCamPawn->SetActorLocationAndRotation(
+			CameraLocation,
+			CameraRotation,
+			false,
+			nullptr,
+			ETeleportType::TeleportPhysics);
+	}
+
+	if (IsValid(FlyCamPawn))
+	{
+		SetControlRotation(CameraRotation);
+		Possess(FlyCamPawn);
 	}
 }
 
 bool ArmctestPlayerController::ShouldUseTouchControls() const
 {
-	// are we on a mobile platform? Should we force touch?
-	return SVirtualJoystick::ShouldDisplayTouchInterface() || bForceTouchControls;
+	return SVirtualJoystick::ShouldDisplayTouchInterface()
+		|| bForceTouchControls;
 }
