@@ -189,7 +189,9 @@ private:
 	// ── Pool management (driven by the AllocState readback) ───────────────
 	bool   bWantCompact = false;
 	uint32 PendingNewCapacity = 0;
-	void HandleAllocState(uint32 Head, uint32 Overflow, uint32 TotalLive);
+	uint32 LastPoolChangeSerial = 0;   // update serial of the last pool init/compact
+	uint32 StateSerialInFlight = 0;    // update serial the in-flight state readback observed
+	void HandleAllocState(uint32 Head, uint32 Overflow, uint32 TotalLive, uint32 Serial);
 
 	// ── GPU-resident buffers (created on the render thread, refs cached here
 	//    so they survive scene-proxy recreation) ─────────────────────────────
@@ -210,6 +212,25 @@ private:
 	FRHIGPUBufferReadback* StateReadback = nullptr;
 	bool                   bStatePending = false;
 	std::atomic<bool>      bStateArmed{ false };
+
+	// ── Ray tracing: per-chunk BLAS with exact triangle counts ─────────────
+	// Exact per-chunk pool offsets / vertex counts come from a readback of the
+	// GPU alloc table. Each readback is tagged with the update serial it
+	// observed; a slot's BLAS is only (re)built from table data at least as new
+	// as the slot's last re-mesh, so the BLAS always matches the pool contents.
+	uint32               UpdateSerial = 0;
+	TArray<uint32>       SlotDirtySerial;    // serial of each slot's last re-mesh
+	TSet<uint32>         BlasPending;        // slots whose BLAS needs (re)building
+	TArray<FUintVector4> LastAllocTable;     // latest alloc-table readback
+	uint32               LastAllocTableSerial = 0;
+
+	FRHIGPUBufferReadback* TableReadback = nullptr;
+	bool                   bTablePending = false;
+	std::atomic<bool>      bTableArmed{ false };
+	uint32                 TableSerialInFlight = 0;
+
+	void HandleAllocTable(TArray<FUintVector4>&& Table, uint32 Serial);
+	void DrainBlasPending();
 
 	// ── Collision (GPU gather -> readback -> async cook) ───────────────────
 	FRHIGPUBufferReadback* CollMetaReadback = nullptr;

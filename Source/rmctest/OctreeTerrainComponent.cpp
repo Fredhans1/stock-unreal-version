@@ -11,9 +11,14 @@
 #include "Materials/MaterialInterface.h"
 #include "Materials/MaterialRenderProxy.h"
 #include "PrimitiveSceneProxy.h"
+#include "PrimitiveUniformShaderParameters.h"
+#include "PrimitiveUniformShaderParametersBuilder.h"
 #include "RHICommandList.h"
+#include "RayTracingGeometry.h"
+#include "RayTracingInstance.h"
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
+#include "RenderUtils.h"
 #include "RenderingThread.h"
 #include "SceneManagement.h"
 #include "ShaderParameterStruct.h"
@@ -30,6 +35,15 @@ namespace OctreeTerrain
 	constexpr int32  MaxLODs        = 10;
 	constexpr uint32 FlagEmpty      = 1u;
 
+	// One BLAS (re)build request for the scene proxy: the chunk's exact range
+	// in the vertex pool, taken from an alloc-table readback.
+	struct FBlasBuild
+	{
+		uint32 Slot = 0;
+		uint32 Offset = 0;
+		uint32 VertCount = 0;
+	};
+
 	// Everything the render-thread update graph needs, snapshotted on the game
 	// thread so the GPU pipeline never depends on mutable component state.
 	struct FUpdateBatch
@@ -38,6 +52,7 @@ namespace OctreeTerrain
 		bool bCompact = false;
 		bool bCollision = false;
 		bool bStateReadback = false;
+		bool bTableReadback = false;
 		bool bActiveChanged = false;
 
 		uint32 Capacity = 0;
@@ -63,6 +78,7 @@ namespace OctreeTerrain
 		TArray<uint32>       EditIdx;
 		TArray<uint32>       CollSlots;
 		TArray<uint32>       ActiveSlots;
+		TArray<uint32>       BlasReleases;  // slots that became empty this update
 	};
 
 	static int32 PosMod(int32 A, int32 M)
@@ -270,7 +286,13 @@ public:
 			? static_cast<UMaterialInterface*>(InComponent->TerrainMaterial)
 			: UMaterial::GetDefaultMaterial(MD_Surface);
 		MaterialRelevance = Material->GetRelevance_Concurrent(GetScene().GetShaderPlatform());
-		bSupportsGPUScene = true;
+		// GPU-Scene must stay OFF: this proxy's ray tracing instances are
+		// dynamic (per-chunk BLAS via GetDynamicRayTracingInstances) and have
+		// no GPU-Scene instance entries - with GPU-Scene enabled, path-traced
+		// hit shading resolves per-primitive data through garbage instance ids
+		// (terrain shades black in PT). The raster path uses per-frame
+		// primitive uniform buffers either way.
+		bSupportsGPUScene = false;
 	}
 
 	virtual ~FOctreeTerrainSceneProxy() override
@@ -286,6 +308,20 @@ public:
 		UVBufWrap.ReleaseResource();
 		ColorBufWrap.ReleaseResource();
 		IdentityIndexBufWrap.ReleaseResource();
+
+#if RHI_RAYTRACING
+		for (TUniquePtr<FRayTracingGeometry>& Geo : ChunkBLAS)
+		{
+			if (Geo.IsValid())
+			{
+				if (Geo->IsInitialized())
+				{
+					Geo->ReleaseResource();
+				}
+				Geo.Reset();
+			}
+		}
+#endif
 	}
 
 	// (Re)points the vertex factory at the current pool buffers. Called on init
@@ -400,6 +436,197 @@ public:
 		ActiveSlots = MoveTemp(InActiveSlots);
 	}
 
+#if RHI_RAYTRACING
+	// (Re)builds the BLAS of the given chunks against the current vertex pool
+	// and releases the BLAS of chunks that became empty. Each BLAS is built
+	// indexed through the whole-pool identity IB at the chunk's byte offset, so
+	// it covers exactly the chunk's triangles and the index values stay global
+	// vertex ids (the same trick the raster path uses for attribute fetch).
+	void UpdateChunkBLAS_RenderThread(const TArray<OctreeTerrain::FBlasBuild>& Builds, const TArray<uint32>& Releases)
+	{
+		check(IsInRenderingThread());
+
+		if (ChunkBLAS.Num() != int32(MaxChunks))
+		{
+			ChunkBLAS.SetNum(MaxChunks);
+			BlasOffset.SetNumZeroed(MaxChunks);
+			BlasVertCount.SetNumZeroed(MaxChunks);
+		}
+
+		auto ReleaseSlot = [this](uint32 Slot)
+		{
+			if (Slot < uint32(ChunkBLAS.Num()) && ChunkBLAS[Slot].IsValid())
+			{
+				if (ChunkBLAS[Slot]->IsInitialized())
+				{
+					ChunkBLAS[Slot]->ReleaseResource();
+				}
+				ChunkBLAS[Slot].Reset();
+				BlasVertCount[Slot] = 0;
+			}
+		};
+
+		for (uint32 Slot : Releases)
+		{
+			ReleaseSlot(Slot);
+		}
+
+		if (Builds.Num() == 0)
+		{
+			return;
+		}
+		// IsRayTracingAllowed (static), NOT IsRayTracingEnabled: with on-demand
+		// dynamic ray tracing the enable toggle flips at runtime, and builds
+		// dropped while it is off would leave chunks without BLAS forever
+		// (their slots were already removed from the pending set).
+		if (!IsRayTracingAllowed() || !CurrentPos.IsValid() || !CurrentIdentity.IsValid())
+		{
+			return;
+		}
+
+		FRHIBuffer* PosRHI = CurrentPos->GetRHI();
+		FRHIBuffer* IdentRHI = CurrentIdentity->GetRHI();
+		if (!PosRHI || !IdentRHI)
+		{
+			return;
+		}
+
+		FRHICommandListImmediate& RHICmdList = FRHICommandListExecutor::GetImmediateCommandList();
+
+		for (const OctreeTerrain::FBlasBuild& Bld : Builds)
+		{
+			if (Bld.Slot >= uint32(ChunkBLAS.Num()))
+			{
+				continue;
+			}
+			ReleaseSlot(Bld.Slot);
+
+			if (Bld.VertCount < 3 || Bld.Offset + Bld.VertCount > Capacity)
+			{
+				continue;
+			}
+			// D3D12 requires BLAS index-buffer offsets to be 16-byte aligned;
+			// the GPU allocator advances in 4-vertex steps to guarantee this.
+			if ((Bld.Offset & 3u) != 0)
+			{
+				continue;
+			}
+			const uint32 NumTris = Bld.VertCount / 3;
+
+			TUniquePtr<FRayTracingGeometry> Geo = MakeUnique<FRayTracingGeometry>();
+
+			FRayTracingGeometryInitializer Initializer;
+			Initializer.IndexBuffer = IdentRHI;
+			Initializer.IndexBufferOffset = Bld.Offset * sizeof(uint32);
+			Initializer.GeometryType = RTGT_Triangles;
+			Initializer.bFastBuild = true;     // chunks re-mesh at edit rates
+			Initializer.bAllowUpdate = false;  // exact-fit ranges move, so always full rebuilds
+			Initializer.DebugName = FName("OctreeChunkBLAS");
+			Initializer.TotalPrimitiveCount = NumTris;
+
+			FRayTracingGeometrySegment Segment;
+			Segment.VertexBuffer = PosRHI;
+			Segment.VertexBufferOffset = 0;
+			Segment.VertexBufferStride = 16;   // float4 positions, xyz read
+			Segment.VertexBufferElementType = VET_Float3;
+			Segment.MaxVertices = Bld.Offset + Bld.VertCount;
+			Segment.NumPrimitives = NumTris;
+			Segment.FirstPrimitive = 0;
+			Initializer.Segments.Add(Segment);
+
+			Geo->SetInitializer(Initializer);
+			Geo->InitResource(RHICmdList);
+
+			ChunkBLAS[Bld.Slot] = MoveTemp(Geo);
+			BlasOffset[Bld.Slot] = Bld.Offset;
+			BlasVertCount[Bld.Slot] = Bld.VertCount;
+		}
+	}
+
+	// The base implementation gates on IsDrawnInGame() and static-mesh-style
+	// caching; returning Dynamic routes this proxy through
+	// GetDynamicRayTracingInstances every frame (VoxelMeshComponent's proven
+	// bypass).
+	virtual ERayTracingPrimitiveFlags GetCachedRayTracingInstance(FRayTracingInstance& OutRayTracingInstance) override
+	{
+		// Static check only: this result is cached, and with on-demand dynamic
+		// ray tracing the runtime toggle may be off at caching time.
+		if (!IsRayTracingAllowed())
+		{
+			return ERayTracingPrimitiveFlags::Exclude;
+		}
+		return ERayTracingPrimitiveFlags::Dynamic;
+	}
+
+	virtual void GetDynamicRayTracingInstances(FRayTracingInstanceCollector& Collector) override
+	{
+		if (!bBuffersReady || !VertexFactory || !VertexFactory->IsInitialized())
+		{
+			return;
+		}
+
+		FMaterialRenderProxy* MaterialProxy = Material->GetRenderProxy();
+		if (!MaterialProxy)
+		{
+			return;
+		}
+
+		// Real primitive data for hit shading (identity UB lacks valid scene
+		// metadata and path-traced shading goes black with it). All chunks
+		// share the proxy and its transform, so one buffer serves every batch.
+		FDynamicPrimitiveUniformBuffer& DynamicPrimitiveUniformBuffer = Collector.AllocateOneFrameResource<FDynamicPrimitiveUniformBuffer>();
+		{
+			FPrimitiveUniformShaderParametersBuilder Builder;
+			BuildUniformShaderParameters(Builder);
+			DynamicPrimitiveUniformBuffer.Set(Collector.GetRHICommandList(), Builder);
+		}
+
+		// One instance per chunk that has a built BLAS. FirstIndex uses the
+		// offset/count the BLAS was committed with (not the live draw args), so
+		// geometry and attribute fetch stay consistent even while a re-meshed
+		// chunk waits for its BLAS rebuild.
+		for (int32 Slot = 0; Slot < ChunkBLAS.Num(); Slot++)
+		{
+			FRayTracingGeometry* Geo = ChunkBLAS[Slot].Get();
+			if (!Geo || !Geo->IsInitialized() || BlasVertCount[Slot] < 3)
+			{
+				continue;
+			}
+
+			FRayTracingInstance RayTracingInstance;
+			RayTracingInstance.Geometry = Geo;
+			RayTracingInstance.InstanceTransforms.Add(GetLocalToWorld());
+
+			FMeshBatch MeshBatch;
+			MeshBatch.VertexFactory = VertexFactory;
+			MeshBatch.SegmentIndex = 0;
+			MeshBatch.MaterialRenderProxy = MaterialProxy;
+			MeshBatch.Type = PT_TriangleList;
+			MeshBatch.DepthPriorityGroup = SDPG_World;
+			MeshBatch.bCanApplyViewModeOverrides = false;
+			MeshBatch.bDisableBackfaceCulling = true;
+			MeshBatch.CastRayTracedShadow = true;
+			MeshBatch.ReverseCulling = IsLocalToWorldDeterminantNegative();
+
+			FMeshBatchElement& BatchElement = MeshBatch.Elements[0];
+			BatchElement.IndexBuffer = &IdentityIndexBufWrap;
+			BatchElement.FirstIndex = BlasOffset[Slot];
+			BatchElement.NumPrimitives = BlasVertCount[Slot] / 3;
+			BatchElement.BaseVertexIndex = 0;
+			BatchElement.MinVertexIndex = 0;
+			BatchElement.MaxVertexIndex = Capacity > 0 ? Capacity - 1 : 0;
+			BatchElement.PrimitiveUniformBufferResource = &DynamicPrimitiveUniformBuffer.UniformBuffer;
+
+			RayTracingInstance.Materials.Add(MeshBatch);
+			Collector.AddRayTracingInstance(0, MoveTemp(RayTracingInstance));
+		}
+	}
+
+	virtual bool IsRayTracingRelevant() const override { return true; }
+	virtual bool IsRayTracingStaticRelevant() const override { return false; }
+	virtual bool HasRayTracingRepresentation() const override { return true; }
+#endif // RHI_RAYTRACING
+
 	virtual void GetDynamicMeshElements(const TArray<const FSceneView*>& Views,
 		const FSceneViewFamily& ViewFamily, uint32 VisibilityMap,
 		FMeshElementCollector& Collector) const override
@@ -503,6 +730,15 @@ private:
 	FPooledVertexBuffer ColorBufWrap;
 	FPooledIndexBuffer  IdentityIndexBufWrap;
 
+#if RHI_RAYTRACING
+	// Per-chunk BLAS plus the pool range each was committed with. A stale BLAS
+	// keeps its source pool alive through the FBufferRHIRef in its initializer,
+	// so chunks remain traceable across pool swaps until their rebuild lands.
+	TArray<TUniquePtr<FRayTracingGeometry>> ChunkBLAS;
+	TArray<uint32> BlasOffset;
+	TArray<uint32> BlasVertCount;
+#endif
+
 	FLocalVertexFactory* VertexFactory = nullptr;
 	UMaterialInterface*  Material = nullptr;
 	FMaterialRelevance   MaterialRelevance;
@@ -521,6 +757,7 @@ UOctreeTerrainComponent::UOctreeTerrainComponent()
 	bCastDynamicShadow = true;
 	bCastStaticShadow = false;
 	bUseAsOccluder = false;
+	bVisibleInRayTracing = true;
 	SetCullDistance(0.0f);
 
 	SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
@@ -595,6 +832,12 @@ void UOctreeTerrainComponent::BeginPlay()
 	bForceAllDirty = true;
 	bCollRegionDirty = true;
 
+	UpdateSerial = 0;
+	SlotDirtySerial.Init(0, MaxChunks);
+	BlasPending.Empty();
+	LastAllocTable.Empty();
+	LastAllocTableSerial = 0;
+
 	UE_LOG(LogTemp, Log,
 		TEXT("OctreeTerrain: %d slots (%d LODs x %d), %d cells/axis, pool %u verts (%.1f MB streams)"),
 		MaxChunks, NumLODLevels, ChunksPerLOD, CellsN, CurrentCapacity,
@@ -612,8 +855,10 @@ void UOctreeTerrainComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	delete StateReadback;    StateReadback = nullptr;
 	delete CollMetaReadback; CollMetaReadback = nullptr;
 	delete CollPosReadback;  CollPosReadback = nullptr;
+	delete TableReadback;    TableReadback = nullptr;
 	bStatePending = false;
 	bCollPending = false;
+	bTablePending = false;
 
 	Super::EndPlay(EndPlayReason);
 }
@@ -651,6 +896,16 @@ void UOctreeTerrainComponent::GetUsedMaterials(TArray<UMaterialInterface*>& OutM
 
 FPrimitiveSceneProxy* UOctreeTerrainComponent::CreateSceneProxy()
 {
+	if (!TerrainMaterial)
+	{
+		// The MD_Surface default (WorldGridMaterial) is a special engine
+		// material whose ray tracing hit shading returns garbage attributes
+		// (terrain shades black in the path tracer). Fall back to a regular
+		// engine material so RT/PT work without a user-assigned material.
+		TerrainMaterial = LoadObject<UMaterialInterface>(nullptr,
+			TEXT("/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial"));
+	}
+
 	FOctreeTerrainSceneProxy* Proxy = new FOctreeTerrainSceneProxy(this);
 
 	// If the GPU buffers already exist (proxy recreation after a render-state
@@ -668,6 +923,18 @@ FPrimitiveSceneProxy* UOctreeTerrainComponent::CreateSceneProxy()
 				Proxy->SetActiveSlots_RenderThread(MoveTemp(Slots));
 			});
 	}
+
+#if RHI_RAYTRACING
+	// The fresh proxy has no BLAS; queue every active chunk for a rebuild
+	// (their alloc-table data is still current, so the next drain handles it).
+	if (IsRayTracingAllowed())
+	{
+		for (uint32 Slot : CachedActiveSlots)
+		{
+			BlasPending.Add(Slot);
+		}
+	}
+#endif
 
 	return Proxy;
 }
@@ -727,6 +994,20 @@ void UOctreeTerrainComponent::TickComponent(float DeltaTime, ELevelTick TickType
 		bUpdateRequested = true;
 	}
 
+#if RHI_RAYTRACING
+	if (IsRayTracingAllowed())
+	{
+		// Build BLAS for slots whose table data is already fresh enough
+		// (budget-limited leftovers from a previous drain), then request a new
+		// alloc-table snapshot if stale slots remain.
+		DrainBlasPending();
+		if (BlasPending.Num() > 0 && !bTablePending)
+		{
+			bUpdateRequested = true;
+		}
+	}
+#endif
+
 	const FVector PlayerPos = GetPlayerPosition();
 	const bool bMoved = FVector::Dist(PlayerPos, LastUpdatePlayerPos) > UpdateThreshold;
 
@@ -775,8 +1056,15 @@ bool UOctreeTerrainComponent::ChunkMayHaveSurface(const FIntVector& Coord, int32
 	return false;
 }
 
-void UOctreeTerrainComponent::HandleAllocState(uint32 Head, uint32 Overflow, uint32 TotalLive)
+void UOctreeTerrainComponent::HandleAllocState(uint32 Head, uint32 Overflow, uint32 TotalLive, uint32 Serial)
 {
+	// A snapshot taken before the latest pool init/compaction describes the old
+	// pool; acting on its head/overflow would double-grow or re-compact.
+	if (Serial < LastPoolChangeSerial)
+	{
+		return;
+	}
+
 	const uint64 Cap = CurrentCapacity;
 
 	if (Overflow)
@@ -824,6 +1112,14 @@ void UOctreeTerrainComponent::BuildAndEnqueueUpdate(const FVector& PlayerPos)
 	B.bInit = !bGPUInitialized;
 	B.bCompact = bWantCompact && !B.bInit;
 	const bool bForceAll = bForceAllDirty || B.bInit;
+
+	// Every update gets a serial; readbacks are tagged with the serial current
+	// when they were requested so consumers can detect pre-pool-swap snapshots.
+	++UpdateSerial;
+	if (B.bInit || B.bCompact)
+	{
+		LastPoolChangeSerial = UpdateSerial;
+	}
 
 	if (B.bCompact && PendingNewCapacity > CurrentCapacity)
 	{
@@ -1051,6 +1347,44 @@ void UOctreeTerrainComponent::BuildAndEnqueueUpdate(const FVector& PlayerPos)
 	CachedActiveSlots = Active;
 	B.ActiveSlots = MoveTemp(Active);
 
+#if RHI_RAYTRACING
+	// ── 5b. BLAS bookkeeping ────────────────────────────────────────────────
+	// Re-meshed chunks need a BLAS rebuild once this update's exact counts can
+	// be read back; emptied chunks release theirs right away.
+	// IsRayTracingAllowed, not IsRayTracingEnabled: with on-demand dynamic ray
+	// tracing the runtime toggle can be off during this update (e.g. the init
+	// update that dirties every chunk), and slots skipped here would never get
+	// a BLAS - chunks only re-enter this path when they happen to re-mesh.
+	if (IsRayTracingAllowed())
+	{
+		const uint32 Serial = UpdateSerial;
+		for (int32 Slot = 0; Slot < MaxChunks; Slot++)
+		{
+			if (DirtyMask[Slot] == 1)
+			{
+				SlotDirtySerial[Slot] = Serial;
+				BlasPending.Add(uint32(Slot));
+			}
+			else if (DirtyMask[Slot] == 2)
+			{
+				SlotDirtySerial[Slot] = Serial;
+				BlasPending.Remove(uint32(Slot));
+				B.BlasReleases.Add(uint32(Slot));
+			}
+		}
+		if (B.bCompact)
+		{
+			// Compaction moves every chunk's pool range, so every active chunk
+			// needs a rebuild from this update's table (clean ones included).
+			for (uint32 Slot : B.ActiveSlots)
+			{
+				SlotDirtySerial[Slot] = Serial;
+				BlasPending.Add(Slot);
+			}
+		}
+	}
+#endif
+
 	// ── 6. Collision request (LOD 0 region around the player) ──────────────
 	{
 		const double S0 = ChunkSizeForLOD(0);
@@ -1111,9 +1445,26 @@ void UOctreeTerrainComponent::BuildAndEnqueueUpdate(const FVector& PlayerPos)
 		B.bStateReadback = true;
 		bStatePending = true;
 		bStateArmed.store(false, std::memory_order_release);
+		StateSerialInFlight = UpdateSerial;
 	}
 
-	const bool bAnyWork = B.bInit || B.bCompact || B.bCollision || B.bActiveChanged || B.DirtyB.Num() > 0;
+#if RHI_RAYTRACING
+	// ── 7b. Alloc-table readback for pending BLAS builds (one in flight) ───
+	if (IsRayTracingAllowed() && !bTablePending && BlasPending.Num() > 0)
+	{
+		if (!TableReadback)
+		{
+			TableReadback = new FRHIGPUBufferReadback(TEXT("OctreeAllocTableReadback"));
+		}
+		B.bTableReadback = true;
+		bTablePending = true;
+		bTableArmed.store(false, std::memory_order_release);
+		TableSerialInFlight = UpdateSerial;
+	}
+#endif
+
+	const bool bAnyWork = B.bInit || B.bCompact || B.bCollision || B.bActiveChanged ||
+		B.bTableReadback || B.DirtyB.Num() > 0 || B.BlasReleases.Num() > 0;
 	if (!bAnyWork)
 	{
 		if (B.bStateReadback)
@@ -1179,7 +1530,9 @@ void UOctreeTerrainComponent::BuildAndEnqueueUpdate(const FVector& PlayerPos)
 				ArgsDesc.Usage |= BUF_DrawIndirect | BUF_UnorderedAccess | BUF_ShaderResource;
 				ArgsBuf = GraphBuilder.CreateBuffer(ArgsDesc, TEXT("OctreeDrawArgs"));
 
-				AllocBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(16, B.MaxChunks), TEXT("OctreeChunkAlloc"));
+				FRDGBufferDesc AllocDesc = FRDGBufferDesc::CreateBufferDesc(16, B.MaxChunks);
+				AllocDesc.Usage |= BUF_SourceCopy;   // read back for per-chunk BLAS counts
+				AllocBuf = GraphBuilder.CreateBuffer(AllocDesc, TEXT("OctreeChunkAlloc"));
 
 				FRDGBufferDesc StateDesc = FRDGBufferDesc::CreateBufferDesc(4, 8);
 				StateDesc.Usage |= BUF_SourceCopy;
@@ -1214,6 +1567,15 @@ void UOctreeTerrainComponent::BuildAndEnqueueUpdate(const FVector& PlayerPos)
 				if (Count > 0)
 				{
 					GraphBuilder.QueueBufferUpload(Buf, Data, uint64(Stride) * Count);
+				}
+				else
+				{
+					// Empty lists still get a dummy element: the buffer may be
+					// referenced as an SRV (e.g. zero edits), and RDG requires
+					// referenced resources to be produced.
+					void* Zero = GraphBuilder.Alloc(Stride, 16);
+					FMemory::Memzero(Zero, Stride);
+					GraphBuilder.QueueBufferUpload(Buf, Zero, Stride);
 				}
 				return Buf;
 			};
@@ -1294,9 +1656,15 @@ void UOctreeTerrainComponent::BuildAndEnqueueUpdate(const FVector& PlayerPos)
 			}
 
 			// --- PASS: count --------------------------------------------------
-			if (DirtyCount > 0)
+			// A compact pass reads CountsRO even with zero dirty chunks (it
+			// only dereferences dirty slots, but RDG requires every referenced
+			// resource to be produced), so clear it for compacts too.
+			if (DirtyCount > 0 || B.bCompact)
 			{
 				AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(CountsBuf, PF_R32_UINT), 0u);
+			}
+			if (DirtyCount > 0)
+			{
 				AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(CursorsBuf, PF_R32_UINT), 0u);
 
 				TShaderMapRef<FOctreeCountCS> CS(ShaderMap);
@@ -1461,6 +1829,12 @@ void UOctreeTerrainComponent::BuildAndEnqueueUpdate(const FVector& PlayerPos)
 				{
 					Proxy->SetActiveSlots_RenderThread(B.ActiveSlots);
 				}
+#if RHI_RAYTRACING
+				if (B.BlasReleases.Num() > 0)
+				{
+					Proxy->UpdateChunkBLAS_RenderThread(TArray<OctreeTerrain::FBlasBuild>(), B.BlasReleases);
+				}
+#endif
 			}
 
 			if (B.bStateReadback && StateReadback && PoolState.IsValid())
@@ -1468,6 +1842,14 @@ void UOctreeTerrainComponent::BuildAndEnqueueUpdate(const FVector& PlayerPos)
 				StateReadback->EnqueueCopy(RHICmdList, PoolState->GetRHI(), 16);
 				bStateArmed.store(true, std::memory_order_release);
 			}
+
+#if RHI_RAYTRACING
+			if (B.bTableReadback && TableReadback && PoolAlloc.IsValid())
+			{
+				TableReadback->EnqueueCopy(RHICmdList, PoolAlloc->GetRHI(), B.MaxChunks * sizeof(FUintVector4));
+				bTableArmed.store(true, std::memory_order_release);
+			}
+#endif
 
 			if (B.bCollision && CollMetaPooled.IsValid() && CollPosPooled.IsValid())
 			{
@@ -1491,9 +1873,10 @@ void UOctreeTerrainComponent::PollReadbacks()
 		bStateArmed.store(false, std::memory_order_release);
 
 		FRHIGPUBufferReadback* Readback = StateReadback;
+		const uint32 Serial = StateSerialInFlight;
 		TWeakObjectPtr<UOctreeTerrainComponent> WeakThis(this);
 		ENQUEUE_RENDER_COMMAND(OctreeReadAllocState)(
-			[Readback, WeakThis](FRHICommandListImmediate&)
+			[Readback, Serial, WeakThis](FRHICommandListImmediate&)
 			{
 				const uint32* Data = static_cast<const uint32*>(Readback->Lock(16));
 				if (!Data)
@@ -1505,15 +1888,50 @@ void UOctreeTerrainComponent::PollReadbacks()
 				const uint32 Live = Data[2];
 				Readback->Unlock();
 
-				AsyncTask(ENamedThreads::GameThread, [WeakThis, Head, Overflow, Live]()
+				AsyncTask(ENamedThreads::GameThread, [WeakThis, Head, Overflow, Live, Serial]()
 				{
 					if (UOctreeTerrainComponent* Comp = WeakThis.Get())
 					{
-						Comp->HandleAllocState(Head, Overflow, Live);
+						Comp->HandleAllocState(Head, Overflow, Live, Serial);
 					}
 				});
 			});
 	}
+
+#if RHI_RAYTRACING
+	// --- alloc table (exact per-chunk offsets/counts for BLAS builds) -------
+	if (bTablePending && bTableArmed.load(std::memory_order_acquire) && TableReadback && TableReadback->IsReady())
+	{
+		bTablePending = false;
+		bTableArmed.store(false, std::memory_order_release);
+
+		FRHIGPUBufferReadback* Readback = TableReadback;
+		const int32 NumChunks = MaxChunks;
+		const uint32 Serial = TableSerialInFlight;
+		TWeakObjectPtr<UOctreeTerrainComponent> WeakThis(this);
+		ENQUEUE_RENDER_COMMAND(OctreeReadAllocTable)(
+			[Readback, NumChunks, Serial, WeakThis](FRHICommandListImmediate&)
+			{
+				const uint32 Bytes = uint32(NumChunks) * sizeof(FUintVector4);
+				const FUintVector4* Data = static_cast<const FUintVector4*>(Readback->Lock(Bytes));
+				if (!Data)
+				{
+					return;
+				}
+				TArray<FUintVector4> Table(Data, NumChunks);
+				Readback->Unlock();
+
+				AsyncTask(ENamedThreads::GameThread,
+					[WeakThis, Table = MoveTemp(Table), Serial]() mutable
+					{
+						if (UOctreeTerrainComponent* Comp = WeakThis.Get())
+						{
+							Comp->HandleAllocTable(MoveTemp(Table), Serial);
+						}
+					});
+			});
+	}
+#endif
 
 	// --- collision geometry -------------------------------------------------
 	if (bCollPending && bCollArmed.load(std::memory_order_acquire) &&
@@ -1561,9 +1979,10 @@ void UOctreeTerrainComponent::PollReadbacks()
 					return;
 				}
 
-				// The GPU soup's emit order faces into the solid in UE's
-				// left-handed world; Chaos trimesh queries are one-sided, so
-				// flip the winding to face outward.
+				// The GPU soup's native MC order is what DXR treats as
+				// front-facing, but Chaos uses the opposite convention and its
+				// trimesh queries are one-sided - flip here so traces hit the
+				// terrain from outside.
 				TArray<FTriIndices> NewTris;
 				NewTris.Reserve(NewVerts.Num() / 3);
 				for (int32 i = 0; i + 2 < NewVerts.Num(); i += 3)
@@ -1587,6 +2006,71 @@ void UOctreeTerrainComponent::PollReadbacks()
 					});
 			});
 	}
+}
+
+void UOctreeTerrainComponent::HandleAllocTable(TArray<FUintVector4>&& Table, uint32 Serial)
+{
+	LastAllocTable = MoveTemp(Table);
+	LastAllocTableSerial = Serial;
+	DrainBlasPending();
+}
+
+void UOctreeTerrainComponent::DrainBlasPending()
+{
+#if RHI_RAYTRACING
+	if (BlasPending.Num() == 0 || LastAllocTable.Num() != MaxChunks || !SceneProxy)
+	{
+		return;
+	}
+
+	// Budgeted: a force-all rebuild queues every chunk, and thousands of BLAS
+	// builds in one frame would hitch. Leftovers drain on subsequent ticks.
+	constexpr int32 MaxBuildsPerDrain = 256;
+	TArray<OctreeTerrain::FBlasBuild> Builds;
+	Builds.Reserve(FMath::Min(BlasPending.Num(), MaxBuildsPerDrain));
+
+	for (auto It = BlasPending.CreateIterator(); It; ++It)
+	{
+		const uint32 Slot = *It;
+		if (Slot >= uint32(LastAllocTable.Num()))
+		{
+			It.RemoveCurrent();
+			continue;
+		}
+		// The table snapshot predates this slot's last re-mesh; wait for a
+		// fresher readback (the tick loop requests one).
+		if (LastAllocTableSerial < SlotDirtySerial[Slot])
+		{
+			continue;
+		}
+
+		OctreeTerrain::FBlasBuild Bld;
+		Bld.Slot = Slot;
+		Bld.Offset = LastAllocTable[Slot].X;
+		Bld.VertCount = LastAllocTable[Slot].Y;   // 0 -> proxy releases the BLAS
+		Builds.Add(Bld);
+		It.RemoveCurrent();
+
+		if (Builds.Num() >= MaxBuildsPerDrain)
+		{
+			break;
+		}
+	}
+
+	if (Builds.Num() > 0)
+	{
+		UE_LOG(LogTemp, Verbose, TEXT("OctreeTerrain: BLAS drain - %d builds enqueued, %d still pending"),
+			Builds.Num(), BlasPending.Num());
+		ENQUEUE_RENDER_COMMAND(OctreeBuildChunkBLAS)(
+			[this, Builds = MoveTemp(Builds)](FRHICommandListImmediate&)
+			{
+				if (FOctreeTerrainSceneProxy* Proxy = static_cast<FOctreeTerrainSceneProxy*>(SceneProxy))
+				{
+					Proxy->UpdateChunkBLAS_RenderThread(Builds, TArray<uint32>());
+				}
+			});
+	}
+#endif
 }
 
 void UOctreeTerrainComponent::RebuildCollision()
